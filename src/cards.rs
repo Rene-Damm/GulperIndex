@@ -55,19 +55,49 @@ fn get_bool_property(json: &serde_json::Value, name: &str) -> Result<bool, Error
     }
 }
 
-pub trait Cardlike
+fn load_card_from_json<T: Card, F: FnOnce(CardData) -> Result<T, Error>>(id: u64, f: F) -> Result<T, Error> {
+    let path = get_file_path_for_card(T::typ(), id);
+    let contents = fs::read_to_string(path).map_err(|_| Error::CantAccessCard)?;
+    let json: serde_json::Value = serde_json::from_str(&contents).map_err(|_| Error::CantReadFormatOfCard)?;
+
+    let data = CardData {
+        id,
+        title: get_property(&json, "Title")?,
+        created: get_property(&json, "Created")?,
+        modified: get_property(&json, "Modified")?,
+        tags: Vec::new(),////TODO
+        links: Vec::new(),////TODO
+        contents: json,
+    };
+
+    f(data)
+}
+
+struct CardData {
+    id: u64,
+    title: String,
+    created: DateTime<Utc>,
+    modified: DateTime<Utc>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    contents: serde_json::Value,
+}
+
+pub trait Card
     where Self: Sized {
 
     fn id(&self) -> u64;
     fn title(&self) -> &String;
     fn created(&self) -> DateTime<Utc>;
     fn modified(&self) -> DateTime<Utc>;
+    fn tags(&self) -> std::slice::Iter<'_, String>;
+    fn links(&self) -> std::slice::Iter<'_, String>;
 
     fn typ() -> &'static str;
     fn load(id: u64) -> Result<Self, Error>;
 
     fn sql_schema() ->&'static str;
-    fn sql_count_stmt() -> &'static str;
+    fn sql_table() -> &'static str;
     fn sql_write_stmt() -> &'static str;
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error>;
 
@@ -84,10 +114,10 @@ pub trait Cardlike
 
     fn list() -> Vec<u64> {
 
-        let path = Project::path();
+        let path = Self::path();
         let mut result = Vec::new();
 
-        for entry in path.read_dir().expect("Can read files in project/ directory") {
+        for entry in path.read_dir().expect(format!("Can read files in {}/ directory", Self::typ()).as_str()) {
             if let Ok(entry) = entry {
                 let path = entry.path();
                 if let Some(extension) = path.extension() {
@@ -107,6 +137,30 @@ pub trait Cardlike
 
         result
     }
+
+    fn json(id: u64) -> Result<String, Error> {
+        let path = get_file_path_for_card(Self::typ(), id);
+        if path.exists() {
+            fs::read_to_string(path).map_err(|_| Error::CantAccessCard)
+        }
+        else {
+            Err(Error::CantAccessCard)
+        }
+    }
+
+    fn sql_list_ids(db: &rusqlite::Connection) -> Result<Vec<u64>, Error> {
+        let mut stmt = db.prepare(format!("SELECT id FROM {}", Self::sql_table()).as_str())
+            .map_err(|err| Error::DatabaseError(err.to_string()))?;
+        let mut rows = stmt.query([])
+            .map_err(|err| Error::DatabaseError(err.to_string()))?;
+
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| Error::DatabaseError(err.to_string()))? {
+            ids.push(row.get::<usize, u64>(0).map_err(|err| Error::DatabaseError(err.to_string()))?)
+        }
+
+        Ok(ids)
+    }
 }
 
 pub struct Project {
@@ -114,49 +168,36 @@ pub struct Project {
     title: String,
     created: DateTime<Utc>,
     modified: DateTime<Utc>,
+    tags: Vec<String>,
+    links: Vec<String>,
     active: bool,
     started: Option<NaiveDate>,
     finished: Option<NaiveDate>,
 }
 
-impl Cardlike for Project {
+impl Card for Project {
 
-    fn id(&self) -> u64 {
-        self.id
-    }
-
-    fn title(&self) -> &String {
-        &self.title
-    }
-
-    fn created(&self) -> DateTime<Utc> {
-        self.created
-    }
-
-    fn modified(&self) -> DateTime<Utc> {
-        self.modified
-    }
-
-    fn typ() -> &'static str {
-        "project"
-    }
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.title }
+    fn created(&self) -> DateTime<Utc> { self.created }
+    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> &'static str { "project" }
 
     fn load(id: u64) -> Result<Project, Error> {
-        let path = get_file_path_for_card(Project::typ(), id);
-        let contents = fs::read_to_string(path).map_err(|_| Error::CantAccessCard)?;
-        let json: serde_json::Value = serde_json::from_str(&contents).map_err(|_| Error::CantReadFormatOfCard)?;
-
-        let project = Project {
-            id,
-            title: get_property(&json, "Title")?,
-            created: get_property(&json, "Created")?,
-            modified: get_property(&json, "Modified")?,
-            started: get_optional_property(&json, "Started")?,
-            finished: get_optional_property(&json, "Finished")?,
-            active: get_bool_property(&json, "Active")?,
-        };
-
-        Ok(project)
+        load_card_from_json(id,
+            |data| Ok(Project {
+                id,
+                title: data.title,
+                created: data.created,
+                modified: data.modified,
+                tags: data.tags,
+                links: data.links,
+                started: get_optional_property(&data.contents, "Started")?,
+                finished: get_optional_property(&data.contents, "Finished")?,
+                active: get_bool_property(&data.contents, "Active")?,
+            }))
     }
 
     fn sql_schema() -> &'static str {
@@ -172,9 +213,7 @@ impl Cardlike for Project {
         );"#
     }
 
-    fn sql_count_stmt() -> &'static str {
-        "SELECT COUNT(id) FROM Projects"
-    }
+    fn sql_table() -> &'static str { "Projects" }
 
     fn sql_write_stmt() -> &'static str {
         "INSERT OR REPLACE INTO Projects (id, title, created, modified, started, finished, active) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
@@ -206,6 +245,77 @@ pub struct Task {
 
 pub struct Timelog {
     id: u64,
+    created: DateTime<Utc>,
+    modified: DateTime<Utc>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    description: String,
+    started: DateTime<Utc>,
+    ended: Option<DateTime<Utc>>,
+    category: Option<String>,
+}
+
+impl Card for Timelog {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.description }
+    fn created(&self) -> DateTime<Utc> { self.created }
+    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> &'static str { "timelog" }
+
+    fn load(id: u64) -> Result<Timelog, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Timelog {
+                                id,
+                                description: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                tags: data.tags,
+                                links: data.links,
+                                started: get_property(&data.contents, "Started")?,
+                                ended: get_optional_property(&data.contents, "Ended")?,
+                                category: get_optional_property(&data.contents, "Category")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        CREATE TABLE IF NOT EXISTS Timelogs (
+            id INTEGER PRIMARY KEY,
+            description VARCHAR NOT NULL,
+            created VARCHAR NOT NULL,
+            modified VARCHAR NOT NULL,
+            started VARCHAR NOT NULL,
+            ended VARCHAR,
+            category VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Timelogs" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Timelogs (id, description, created, modified, started, ended, category) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+
+        let started = self.started.to_string();
+        let ended = self.ended.map_or(String::from("NULL"), |d| d.to_string());
+        let created = self.created.to_rfc3339();
+        let modified = self.modified.to_rfc3339();
+
+        stmt.execute(params![
+            self.id,
+            self.description,
+            created,
+            modified,
+            started,
+            ended,
+            self.category,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
 }
 
 pub struct Transaction {
@@ -214,6 +324,73 @@ pub struct Transaction {
 
 pub struct Status {
     id: u64,
+    created: DateTime<Utc>,
+    modified: DateTime<Utc>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    message: String,
+    began: Option<DateTime<Utc>>,
+    ended: Option<DateTime<Utc>>,
+}
+
+impl Card for Status {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.message }
+    fn created(&self) -> DateTime<Utc> { self.created }
+    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> &'static str { "status" }
+
+    fn load(id: u64) -> Result<Status, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Status {
+                                id,
+                                message: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                tags: data.tags,
+                                links: data.links,
+                                began: get_optional_property(&data.contents, "Began")?,
+                                ended: get_optional_property(&data.contents, "Ended")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        CREATE TABLE IF NOT EXISTS Statuses (
+            id INTEGER PRIMARY KEY,
+            message VARCHAR NOT NULL,
+            created VARCHAR NOT NULL,
+            modified VARCHAR NOT NULL,
+            began VARCHAR,
+            ended VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Statuses" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Statuses (id, message, created, modified, began, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+
+        let began = self.began.map_or(String::from("NULL"), |d| d.to_string());
+        let ended = self.ended.map_or(String::from("NULL"), |d| d.to_string());
+        let created = self.created.to_rfc3339();
+        let modified = self.modified.to_rfc3339();
+
+        stmt.execute(params![
+            self.id,
+            self.message,
+            created,
+            modified,
+            began,
+            ended,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
 }
 
 pub struct Book {
@@ -224,14 +401,6 @@ pub struct Book {
 pub struct Account {
     id: u64,
     username: String,
-}
-
-//is this even needed?
-pub enum Card<T: Cardlike> {
-    Card(T)
-}
-
-impl<T: Cardlike> Card<T> {
 }
 
 /*
