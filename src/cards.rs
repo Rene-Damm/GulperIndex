@@ -4,6 +4,38 @@ use std::str::FromStr;
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::params;
 
+#[derive(Copy, Clone)]
+pub enum CardType {
+    Invalid,
+    Project,
+    Status,
+    Timelog,
+}
+
+impl ToString for CardType {
+    fn to_string(&self) -> String {
+        match self {
+            CardType::Invalid => String::from("invalid"),
+            CardType::Project => String::from(Project::typ_str()),
+            CardType::Status => String::from(Status::typ_str()),
+            CardType::Timelog => String::from(Timelog::typ_str()),
+        }
+    }
+}
+
+impl FromStr for CardType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "project" => CardType::Project,
+            "status" => CardType::Status,
+            "timelog" => CardType::Timelog,
+            _ => CardType::Invalid,
+        })
+    }
+}
+
 #[derive(std::fmt::Debug)]
 pub enum Error {
     CantAccessCard,
@@ -55,8 +87,22 @@ fn get_bool_property(json: &serde_json::Value, name: &str) -> Result<bool, Error
     }
 }
 
+fn get_string_list_property(json: &serde_json::Value, name: &str) -> Result<Vec<String>, Error> {
+    match &json[name] {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(vec) => {
+            let mut r = Vec::new();
+            for v in vec.iter() {
+                r.push(String::from(v.as_str().ok_or(Error::CantReadProperty(String::from(name)))?))
+            }
+            Ok(r)
+        }
+        _ => Err(Error::CantReadProperty(String::from(name)))
+    }
+}
+
 fn load_card_from_json<T: Card, F: FnOnce(CardData) -> Result<T, Error>>(id: u64, f: F) -> Result<T, Error> {
-    let path = get_file_path_for_card(T::typ(), id);
+    let path = get_file_path_for_card(T::typ_str(), id);
     let contents = fs::read_to_string(path).map_err(|_| Error::CantAccessCard)?;
     let json: serde_json::Value = serde_json::from_str(&contents).map_err(|_| Error::CantReadFormatOfCard)?;
 
@@ -65,8 +111,8 @@ fn load_card_from_json<T: Card, F: FnOnce(CardData) -> Result<T, Error>>(id: u64
         title: get_property(&json, "Title")?,
         created: get_property(&json, "Created")?,
         modified: get_property(&json, "Modified")?,
-        tags: Vec::new(),////TODO
-        links: Vec::new(),////TODO
+        tags: get_string_list_property(&json, "Tags")?,
+        links: get_string_list_property(&json, "Links")?,
         contents: json,
     };
 
@@ -93,7 +139,8 @@ pub trait Card
     fn tags(&self) -> std::slice::Iter<'_, String>;
     fn links(&self) -> std::slice::Iter<'_, String>;
 
-    fn typ() -> &'static str;
+    fn typ() -> CardType;
+    fn typ_str() -> &'static str;
     fn load(id: u64) -> Result<Self, Error>;
 
     fn sql_schema() ->&'static str;
@@ -102,13 +149,13 @@ pub trait Card
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error>;
 
     fn qualified_id(&self) -> String {
-        format!("{}/{}", Self::typ(), self.id())
+        format!("{}/{}", Self::typ_str(), self.id())
     }
 
     fn path() -> PathBuf {
         let mut path = PathBuf::new();
         path.push(get_path_to_cards());
-        path.push(Self::typ());
+        path.push(Self::typ_str());
         path
     }
 
@@ -117,7 +164,7 @@ pub trait Card
         let path = Self::path();
         let mut result = Vec::new();
 
-        for entry in path.read_dir().expect(format!("Can read files in {}/ directory", Self::typ()).as_str()) {
+        for entry in path.read_dir().expect(format!("Can read files in {}/ directory", Self::typ_str()).as_str()) {
             if let Ok(entry) = entry {
                 let path = entry.path();
                 if let Some(extension) = path.extension() {
@@ -139,7 +186,7 @@ pub trait Card
     }
 
     fn json(id: u64) -> Result<String, Error> {
-        let path = get_file_path_for_card(Self::typ(), id);
+        let path = get_file_path_for_card(Self::typ_str(), id);
         if path.exists() {
             fs::read_to_string(path).map_err(|_| Error::CantAccessCard)
         }
@@ -160,6 +207,32 @@ pub trait Card
         }
 
         Ok(ids)
+    }
+
+    fn sql_write_links(&self, db: &mut rusqlite::Statement) -> Result<(), Error> {
+        for v in self.links() {
+            let colon = v.find(':');
+            let role = match colon {
+                Some(index) => &v[..index],
+                None => "",
+            };
+            let qualified_id = match colon {
+                Some(index) => &v[(index + 1)..],
+                None => &v[..],
+            };
+            let slash = qualified_id.find('/').ok_or(Error::DatabaseError(String::from("card link is missing /")))?;
+            let to_type = CardType::from_str(&qualified_id[..slash]).map_err(|err| Error::DatabaseError(String::from("invalid card type")))?;
+            let to_id = qualified_id[(slash + 1)..].parse::<u64>().map_err(|err| Error::DatabaseError(String::from("invalid card ID")))?;
+
+            db.insert(params![
+                role,
+                Self::typ() as u32,
+                self.id(),
+                to_type as u32,
+                to_id,
+            ]).map_err(|err| Error::DatabaseError(String::from(format!("cannot insert link: {}", err.to_string()))))?;
+        }
+        Ok(())
     }
 }
 
@@ -183,7 +256,8 @@ impl Card for Project {
     fn modified(&self) -> DateTime<Utc> { self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
-    fn typ() -> &'static str { "project" }
+    fn typ() -> CardType { CardType::Project }
+    fn typ_str() -> &'static str { "project" }
 
     fn load(id: u64) -> Result<Project, Error> {
         load_card_from_json(id,
@@ -263,7 +337,8 @@ impl Card for Timelog {
     fn modified(&self) -> DateTime<Utc> { self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
-    fn typ() -> &'static str { "timelog" }
+    fn typ() -> CardType { CardType::Timelog }
+    fn typ_str() -> &'static str { "timelog" }
 
     fn load(id: u64) -> Result<Timelog, Error> {
         load_card_from_json(id,
@@ -341,7 +416,8 @@ impl Card for Status {
     fn modified(&self) -> DateTime<Utc> { self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
-    fn typ() -> &'static str { "status" }
+    fn typ() -> CardType { CardType::Status }
+    fn typ_str() -> &'static str { "status" }
 
     fn load(id: u64) -> Result<Status, Error> {
         load_card_from_json(id,

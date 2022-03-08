@@ -47,6 +47,7 @@ impl<'r> Responder<'r, 'static> for IdList {
     }
 }
 
+// Lists.
 #[get("/project")]
 async fn get_project_list(db: CardsDb) -> IdList {
     db.run(|c| {
@@ -66,6 +67,7 @@ async fn get_timelog_list(db: CardsDb) -> IdList {
     }).await
 }
 
+// Counts.
 #[get("/project/count")]
 async fn get_project_count(db: CardsDb) -> String {
     db.run(|c| {
@@ -91,6 +93,7 @@ async fn get_timelog_count(db: CardsDb) -> String {
     }).await
 }
 
+// Contents.
 #[get("/project/<id>")]
 fn get_project(id: u64) -> (rocket::http::Status, (ContentType, String)) {
     match Project::json(id) {
@@ -117,10 +120,13 @@ fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), 
 
     let mut sql = db.prepare(T::sql_write_stmt())
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+    let mut link = db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
 
     for id in T::list() {
         let card = T::load(id)?;
         card.sql_write(&mut sql)?;
+        card.sql_write_links(&mut link)?;
     }
 
     Ok(())
@@ -158,6 +164,7 @@ async fn init_db(rocket: Rocket<Build>) -> Rocket<Build> {
                 );
                 CREATE TABLE IF NOT EXISTS Links (
                     id INTEGER PRIMARY KEY UNIQUE,
+                    role VARCHAR,
                     from_type INTEGER,
                     from_id INTEGER,
                     to_type INTEGER,
