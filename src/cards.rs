@@ -4,10 +4,13 @@ use std::str::FromStr;
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::params;
 
+////TODO: simply make the table name match typ_str()
+
 #[derive(Copy, Clone)]
 pub enum CardType {
     Invalid,
     Project,
+    Task,
     Status,
     Timelog,
 }
@@ -17,6 +20,7 @@ impl ToString for CardType {
         match self {
             CardType::Invalid => String::from("invalid"),
             CardType::Project => String::from(Project::typ_str()),
+            CardType::Task => String::from(Task::typ_str()),
             CardType::Status => String::from(Status::typ_str()),
             CardType::Timelog => String::from(Timelog::typ_str()),
         }
@@ -29,6 +33,7 @@ impl FromStr for CardType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "project" => CardType::Project,
+            "task" => CardType::Task,
             "status" => CardType::Status,
             "timelog" => CardType::Timelog,
             _ => CardType::Invalid,
@@ -38,6 +43,7 @@ impl FromStr for CardType {
 
 #[derive(std::fmt::Debug)]
 pub enum Error {
+    CantFindCard(String),
     CantAccessCard,
     CantReadFormatOfCard,
     CantReadProperty(String),
@@ -195,6 +201,36 @@ pub trait Card
         }
     }
 
+    fn sql_find_id(db: &rusqlite::Connection, nameOrId: &str) -> Result<u64, Error> {
+        fn get_next_id(rows: &mut rusqlite::Rows, nameOrId: &str) -> Result<u64, Error> {
+            match rows.next() {
+                Err(err) => Err(Error::DatabaseError(err.to_string())),
+                Ok(None) => Err(Error::CantFindCard(String::from(nameOrId))),
+                Ok(Some(row)) => row.get::<usize, u64>(0).map_err(|err| Error::DatabaseError(err.to_string())),
+            }
+        }
+        if let Ok(id) = nameOrId.parse::<u64>() {
+            Ok(id)
+        }
+        else {
+            let mut stmt = db.prepare(&format!("SELECT id FROM Projects WHERE title LIKE '%{}%'", nameOrId))
+                .map_err(|err| Error::DatabaseError(err.to_string()))?;
+            let result = match stmt.query([]) {
+                Err(e) => Err(Error::DatabaseError(e.to_string())),
+                Ok(mut rows) => {
+                    let first = get_next_id(&mut rows, nameOrId);
+                    let second = get_next_id(&mut rows, nameOrId);
+
+                    match (first, second) {
+                        (Ok(_), Ok(_)) => Err(Error::CantFindCard(format!("Name '{}/{}' is ambiguous", Self::typ_str(), nameOrId))),
+                        (f, _) => f
+                    }
+                }
+            };
+            result
+        }
+    }
+
     fn sql_list_ids(db: &rusqlite::Connection) -> Result<Vec<u64>, Error> {
         let mut stmt = db.prepare(format!("SELECT id FROM {}", Self::sql_table()).as_str())
             .map_err(|err| Error::DatabaseError(err.to_string()))?;
@@ -276,7 +312,9 @@ impl Card for Project {
 
     fn sql_schema() -> &'static str {
         r#"
-        CREATE TABLE IF NOT EXISTS Projects (
+        DROP TABLE IF EXISTS Projects;
+        DROP INDEX IF EXISTS ProjectsByName;
+        CREATE TABLE Projects (
             id INTEGER PRIMARY KEY,
             title VARCHAR NOT NULL,
             created VARCHAR NOT NULL,
@@ -284,7 +322,8 @@ impl Card for Project {
             started VARCHAR,
             finished VARCHAR,
             active BOOLEAN DEFAULT 1
-        );"#
+        );
+        CREATE INDEX ProjectsByName ON Projects(title);"#
     }
 
     fn sql_table() -> &'static str { "Projects" }
@@ -314,7 +353,76 @@ impl Card for Project {
 
 pub struct Task {
     id: u64,
-    title: String,
+    description: String,
+    created: DateTime<Utc>,
+    modified: DateTime<Utc>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    obsolete: bool,
+    completed: Option<NaiveDate>,
+}
+
+impl Card for Task {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.description }
+    fn created(&self) -> DateTime<Utc> { self.created }
+    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Task }
+    fn typ_str() -> &'static str { "task" }
+
+    fn load(id: u64) -> Result<Task, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Task {
+                                id,
+                                description: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                tags: data.tags,
+                                links: data.links,
+                                completed: get_optional_property(&data.contents, "Completed")?,
+                                obsolete: get_bool_property(&data.contents, "Obsolete")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Tasks;
+        DROP INDEX IF EXISTS TasksByDescription;
+        CREATE TABLE Tasks (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created VARCHAR NOT NULL,
+            modified VARCHAR NOT NULL,
+            completed VARCHAR,
+            obsolete BOOLEAN
+        );
+        CREATE INDEX TasksByDescription ON Tasks(title);"#
+    }
+
+    fn sql_table() -> &'static str { "Tasks" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Tasks (id, title, created, modified, completed, obsolete) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+
+        let completed = self.completed.map_or(String::from("NULL"), |d| d.to_string());
+        let created = self.created.to_rfc3339();
+        let modified = self.modified.to_rfc3339();
+
+        stmt.execute(params![
+            self.id,
+            self.description,
+            created,
+            modified,
+            completed,
+            self.obsolete,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
 }
 
 pub struct Timelog {
@@ -357,9 +465,10 @@ impl Card for Timelog {
 
     fn sql_schema() -> &'static str {
         r#"
-        CREATE TABLE IF NOT EXISTS Timelogs (
+        DROP TABLE IF EXISTS Timelogs;
+        CREATE TABLE Timelogs (
             id INTEGER PRIMARY KEY,
-            description VARCHAR NOT NULL,
+            title VARCHAR NOT NULL,
             created VARCHAR NOT NULL,
             modified VARCHAR NOT NULL,
             started VARCHAR NOT NULL,
@@ -371,7 +480,7 @@ impl Card for Timelog {
     fn sql_table() -> &'static str { "Timelogs" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Timelogs (id, description, created, modified, started, ended, category) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        "INSERT OR REPLACE INTO Timelogs (id, title, created, modified, started, ended, category) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
@@ -435,9 +544,10 @@ impl Card for Status {
 
     fn sql_schema() -> &'static str {
         r#"
-        CREATE TABLE IF NOT EXISTS Statuses (
+        DROP TABLE IF EXISTS Statuses;
+        CREATE TABLE Statuses (
             id INTEGER PRIMARY KEY,
-            message VARCHAR NOT NULL,
+            title VARCHAR NOT NULL,
             created VARCHAR NOT NULL,
             modified VARCHAR NOT NULL,
             began VARCHAR,
@@ -448,7 +558,7 @@ impl Card for Status {
     fn sql_table() -> &'static str { "Statuses" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Statuses (id, message, created, modified, began, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT OR REPLACE INTO Statuses (id, title, created, modified, began, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {

@@ -13,7 +13,7 @@ use rocket::fairing::AdHoc;
 use rocket_sync_db_pools::{database, rusqlite};
 use rocket::http::ContentType;
 use rocket::response::Responder;
-use crate::cards::{Card, Project, Status, Timelog};
+use crate::cards::{Card, Project, Task, Status, Timelog};
 
 #[database("sqlite_cards")]
 struct CardsDb(rusqlite::Connection);
@@ -54,6 +54,12 @@ async fn get_project_list(db: CardsDb) -> IdList {
         IdList { ids: Project::sql_list_ids(&c).expect("can list project IDs") }
     }).await
 }
+#[get("/task")]
+async fn get_task_list(db: CardsDb) -> IdList {
+    db.run(|c| {
+        IdList { ids: Task::sql_list_ids(&c).expect("can list task IDs") }
+    }).await
+}
 #[get("/status")]
 async fn get_status_list(db: CardsDb) -> IdList {
     db.run(|c| {
@@ -76,6 +82,14 @@ async fn get_project_count(db: CardsDb) -> String {
             .expect("can query project count").to_string()
     }).await
 }
+#[get("/task/count")]
+async fn get_task_count(db: CardsDb) -> String {
+    db.run(|c| {
+        c.query_row(format!("SELECT COUNT(*) FROM {}", Task::sql_table()).as_str(), [],
+                    |row| row.get::<usize, usize>(0))
+            .expect("can query task count").to_string()
+    }).await
+}
 #[get("/status/count")]
 async fn get_status_count(db: CardsDb) -> String {
     db.run(|c| {
@@ -94,26 +108,38 @@ async fn get_timelog_count(db: CardsDb) -> String {
 }
 
 // Contents.
-#[get("/project/<id>")]
-fn get_project(id: u64) -> (rocket::http::Status, (ContentType, String)) {
-    match Project::json(id) {
-        Ok(s) => (rocket::http::Status::Ok, (ContentType::JSON, s)),
-        Err(e) => (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
-    }
+async fn get_card<T: Card>(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
+    let name_or_id_str = String::from(nameOrId);
+    db.run(move |c| {
+        match T::sql_find_id(&c, &name_or_id_str) {
+            Ok(id) => {
+                match T::json(id) {
+                    Ok(s) => (rocket::http::Status::Ok, (ContentType::JSON, s)),
+                    Err(e) => (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
+                }
+            },
+            Err(cards::Error::CantFindCard(s)) =>
+                (rocket::http::Status::BadRequest, (ContentType::Text, format!("Cannot find {} '{}' ({})", T::typ_str(), &name_or_id_str, s))),
+            Err(e) =>
+                (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
+        }
+    }).await
 }
-#[get("/status/<id>")]
-fn get_status(id: u64) -> (rocket::http::Status, (ContentType, String)) {
-    match Status::json(id) {
-        Ok(s) => (rocket::http::Status::Ok, (ContentType::JSON, s)),
-        Err(e) => (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
-    }
+#[get("/project/<nameOrId>")]
+async fn get_project(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
+    get_card::<Project>(db, nameOrId).await
 }
-#[get("/timelog/<id>")]
-fn get_timelog(id: u64) -> (rocket::http::Status, (ContentType, String)) {
-    match Timelog::json(id) {
-        Ok(s) => (rocket::http::Status::Ok, (ContentType::JSON, s)),
-        Err(e) => (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
-    }
+#[get("/task/<nameOrId>")]
+async fn get_task(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
+    get_card::<Task>(db, nameOrId).await
+}
+#[get("/status/<nameOrId>")]
+async fn get_status(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
+    get_card::<Status>(db, nameOrId).await
+}
+#[get("/timelog/<nameOrId>")]
+async fn get_timelog(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
+    get_card::<Timelog>(db, nameOrId).await
 }
 
 fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
@@ -134,6 +160,7 @@ fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), 
 
 fn populate_db_from_scratch(db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
     load_all_cards_into_db::<Project>(db)?;
+    load_all_cards_into_db::<Task>(db)?;
     load_all_cards_into_db::<Status>(db)?;
     load_all_cards_into_db::<Timelog>(db)
 }
@@ -149,9 +176,6 @@ async fn init_db(rocket: Rocket<Build>) -> Rocket<Build> {
                 DROP TABLE IF EXISTS Tags;
                 DROP TABLE IF EXISTS Taggings;
                 DROP TABLE IF EXISTS Links;
-                DROP TABLE IF EXISTS {};
-                DROP TABLE IF EXISTS {};
-                DROP TABLE IF EXISTS {};
                 CREATE TABLE IF NOT EXISTS Tags (
                     id INTEGER PRIMARY KEY UNIQUE,
                     text VARCHAR NOT NULL
@@ -173,9 +197,9 @@ async fn init_db(rocket: Rocket<Build>) -> Rocket<Build> {
                 {}
                 {}
                 {}
+                {}
                 COMMIT;"#,
-               Project::sql_table(), Status::sql_table(), Timelog::sql_table(),
-               Project::sql_schema(), Status::sql_schema(), Timelog::sql_schema());
+               Project::sql_schema(), Task::sql_schema(), Status::sql_schema(), Timelog::sql_schema());
 
             db.execute_batch(&stmt,)
                 .expect("can init DB");
@@ -198,6 +222,7 @@ fn rocket() -> _ {
         .attach(db_init)
         .mount("/", routes![
             get_project_list, get_project_count, get_project,
+            get_task_list, get_task_count, get_task,
             get_status_list, get_status_count, get_status,
             get_timelog_list, get_timelog_count, get_timelog,
         ])
