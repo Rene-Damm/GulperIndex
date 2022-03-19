@@ -1,19 +1,23 @@
+// Fuck Rust...
+
 #[macro_use] extern crate rocket;
 
-// [X] Can load current project cards into DB
-// [ ] Can detect new project card is added
-// [ ] Can add newly added project to DB
-// [ ] Can detect existing project card is removed
-// [ ] Can remove existing project from DB
-// [ ] Can get project card via GET
-
 use std::io::Cursor;
-use rocket::{Rocket, Build, Request, Response};
-use rocket::fairing::AdHoc;
+use std::str::FromStr;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+use notify::{RecursiveMode, Watcher};
+use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+use rocket::{Rocket, Build, Request, Response, Orbit, Data, tokio};
+use rocket::fairing::{AdHoc, Fairing, Info};
+use rocket::futures::executor::block_on;
 use rocket_sync_db_pools::{database, rusqlite};
 use rocket::http::ContentType;
 use rocket::response::Responder;
-use crate::cards::{Card, Project, Task, Status, Timelog};
+use crate::cards::{Card, Project, Task, Status, Timelog, CardType, get_path_to_cards};
+use crate::tokio::task::JoinHandle;
 
 #[database("sqlite_cards")]
 struct CardsDb(rusqlite::Connection);
@@ -142,11 +146,26 @@ async fn get_timelog(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (Con
     get_card::<Timelog>(db, nameOrId).await
 }
 
+fn prepare_card_write_stmts<T: Card>(db: &mut rusqlite::Connection) -> Result<(rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
+    Ok((db.prepare(T::sql_write_stmt())?,
+     db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")?))
+}
+
+fn load_card_into_db<T: Card>(id: u64, db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
+
+    let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
+    let card = T::load(id)?;
+    card.sql_write(&mut sql)?;
+    card.sql_write_links(&mut link)?;
+
+    Ok(())
+}
+
 fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
 
-    let mut sql = db.prepare(T::sql_write_stmt())
-        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
-    let mut link = db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")
+    let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
 
     for id in T::list() {
@@ -211,11 +230,144 @@ async fn init_db(rocket: Rocket<Build>) -> Rocket<Build> {
     rocket
 }
 
+enum FileChange {
+    Added(String),
+    Removed(String),
+    Modified(String),
+}
+
+struct FileWatcher {
+    //watcher: notify::RecommendedWatcher,
+    watcher: JoinHandle<()>,
+    //processor: JoinHandle<()>,
+}
+
+impl Fairing for FileWatcher {
+    fn info(&self) -> Info {
+        Info {
+            name: "FileWatcher",
+            kind: rocket::fairing::Kind::Ignite,
+        }
+    }
+}
+
+
+fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
+
+    let watcher = tokio::spawn(db.run(|c| {
+
+    }));
+
+    /*
+    let (sender, receiver) = channel();
+
+    // Watcher.
+    thread::spawn(move|| {
+
+        let mut watcher = notify::recommended_watcher(|res: Result<notify::Event, notify::Error>| {
+
+            fn is_json_file(path: &PathBuf) -> bool {
+                if let Some(ext) = path.extension() {
+                    ext == "json"
+                }
+                else {
+                    false
+                }
+            }
+
+            match res {
+                Ok(event) => {
+                    match event.kind {
+                        notify::EventKind::Create(_) => {
+                            for path in event.paths.iter().filter(|p| is_json_file(p)) {
+                                println!("Added card {}", path.to_str().unwrap());
+                                if let Some(name) = path.file_stem() {
+                                    sender.send(FileChange::Added(name.to_str().unwrap()))
+                                };
+                            }
+                        },
+                        notify::EventKind::Remove(RemoveKind::File) => {},
+                        notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {},
+                        notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {},
+                        _ => {}, // Ignore
+                    }
+                }
+                Err(e) => println!("FSWatcher error happened: {}", e.to_string()),
+            }
+        })
+            .expect("can create file system watcher");
+
+        watcher.watch(T::path().as_path(), RecursiveMode::NonRecursive)
+            .expect("can watch card directory");
+    })
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+
+        fn is_json_file(path: &PathBuf) -> bool {
+            if let Some(ext) = path.extension() {
+                ext == "json"
+            }
+            else {
+                false
+            }
+        }
+
+        fn add_card<T: Card>(name: String, db: Rc<CardsDb>) {
+            if let Ok(id) = name.parse::<u64>() {
+                db.run(move |c| {
+                    match load_card_into_db::<T>(id, c) {
+                        Err(e) => println!("Cannot write card '{}/{}': {:?}", T::typ_str(), name, e),
+                        _ => (),
+                    }
+                });
+            }
+        }
+
+        match res {
+            Ok(event) => {
+                match event.kind {
+                    notify::EventKind::Create(_) => {
+                        for path in event.paths.iter().filter(|p| is_json_file(p)) {
+                            println!("Added card {}", path.to_str().unwrap());
+                            if let Some(name) = path.file_stem() {
+                                add_card::<T>(String::from(name.to_str().unwrap()), Rc::clone(&db));
+                            };
+                        }
+                    },
+                    notify::EventKind::Remove(RemoveKind::File) => {},
+                    notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {},
+                    notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {},
+                    _ => {}, // Ignore
+                }
+            }
+            Err(e) => println!("FSWatcher error happened: {}", e.to_string()),
+        }
+    })
+        .expect("can create file system watcher");
+
+    watcher.watch(T::path().as_path(), RecursiveMode::NonRecursive)
+        .expect("can watch card directory");
+     */
+
+    //FileWatcher { watcher }
+    FileWatcher { watcher }
+}
+
 #[launch]
 fn rocket() -> _ {
+
     let db_init = AdHoc::on_ignite("Rusqlite Stage", |rocket| async {
-        rocket.attach(CardsDb::fairing())
+        rocket
+            .attach(CardsDb::fairing())
             .attach(AdHoc::on_ignite("Rusqlite Init", init_db))
+            //.attach(AdHoc::on_ignite("FSWatch Projects", init_file_watcher::<Project>))
+            .attach(AdHoc::on_ignite("FSWatch Projects", |rocket| async {
+                let db = CardsDb::get_one(&rocket).await.expect("can get connection to DB");
+                //let dbRef = Rc::new(db);
+                rocket
+                    .attach(init_file_watcher::<Project>(db))
+                    //.attach(init_file_watcher::<Task>(Rc::clone(&dbRef)))
+            }))
     });
 
     rocket::build()

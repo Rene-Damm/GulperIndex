@@ -6,7 +6,7 @@ use rusqlite::params;
 
 ////TODO: simply make the table name match typ_str()
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum CardType {
     Invalid,
     Project,
@@ -50,9 +50,17 @@ pub enum Error {
     DatabaseError(String),
 }
 
-fn get_path_to_cards() -> PathBuf {
+pub fn get_path_to_cards() -> PathBuf {
     ////TODO: Make this configurable.
     PathBuf::from("C:/Dropbox/Data/Cards")
+}
+
+pub fn parse_qualified_id(qualified_id: &str) -> Result<(CardType, u64), Error> {
+    let slash = qualified_id.find('/').ok_or(Error::DatabaseError(String::from("card link is missing /")))?;
+    let typ = CardType::from_str(&qualified_id[..slash]).map_err(|err| Error::DatabaseError(String::from("invalid card type")))?;
+    let id = qualified_id[(slash + 1)..].parse::<u64>().map_err(|err| Error::DatabaseError(String::from("invalid card ID")))?;
+
+    Ok((typ, id))
 }
 
 fn get_file_path_for_card(typ: &str, id: u64) -> PathBuf {
@@ -257,8 +265,7 @@ pub trait Card
                 None => &v[..],
             };
             let slash = qualified_id.find('/').ok_or(Error::DatabaseError(String::from("card link is missing /")))?;
-            let to_type = CardType::from_str(&qualified_id[..slash]).map_err(|err| Error::DatabaseError(String::from("invalid card type")))?;
-            let to_id = qualified_id[(slash + 1)..].parse::<u64>().map_err(|err| Error::DatabaseError(String::from("invalid card ID")))?;
+            let (to_type, to_id) = parse_qualified_id(qualified_id)?;
 
             db.insert(params![
                 role,
