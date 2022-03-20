@@ -1,8 +1,9 @@
 use std::ops::Deref;
 use std::path::{PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use notify::{Watcher};
+use notify::{RecursiveMode, Watcher};
 use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
 use crate::cards::{Card, Project, Task, Status, Timelog, CardType, get_path_to_cards};
@@ -89,77 +90,11 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
     populate_db_from_scratch(db)
 }
 
-/*
-enum FileChange {
-    Added(String),
-    Removed(String),
-    Modified(String),
-}
-
 struct FileWatcher {
-    //watcher: notify::RecommendedWatcher,
-    watcher: JoinHandle<()>,
-    //processor: JoinHandle<()>,
+    watcher: notify::RecommendedWatcher,
 }
 
-impl Fairing for FileWatcher {
-    fn info(&self) -> Info {
-        Info {
-            name: "FileWatcher",
-            kind: rocket::fairing::Kind::Ignite,
-        }
-    }
-}
-
-
-fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
-
-    let watcher = tokio::spawn(db.run(|c| {
-
-    }));
-
-    /*
-    let (sender, receiver) = channel();
-
-    // Watcher.
-    thread::spawn(move|| {
-
-        let mut watcher = notify::recommended_watcher(|res: Result<notify::Event, notify::Error>| {
-
-            fn is_json_file(path: &PathBuf) -> bool {
-                if let Some(ext) = path.extension() {
-                    ext == "json"
-                }
-                else {
-                    false
-                }
-            }
-
-            match res {
-                Ok(event) => {
-                    match event.kind {
-                        notify::EventKind::Create(_) => {
-                            for path in event.paths.iter().filter(|p| is_json_file(p)) {
-                                println!("Added card {}", path.to_str().unwrap());
-                                if let Some(name) = path.file_stem() {
-                                    sender.send(FileChange::Added(name.to_str().unwrap()))
-                                };
-                            }
-                        },
-                        notify::EventKind::Remove(RemoveKind::File) => {},
-                        notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {},
-                        notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {},
-                        _ => {}, // Ignore
-                    }
-                }
-                Err(e) => println!("FSWatcher error happened: {}", e.to_string()),
-            }
-        })
-            .expect("can create file system watcher");
-
-        watcher.watch(T::path().as_path(), RecursiveMode::NonRecursive)
-            .expect("can watch card directory");
-    })
+fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
 
@@ -172,14 +107,14 @@ fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
             }
         }
 
-        fn add_card<T: Card>(name: String, db: Rc<CardsDb>) {
+        fn add_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>) {
             if let Ok(id) = name.parse::<u64>() {
-                db.run(move |c| {
-                    match load_card_into_db::<T>(id, c) {
-                        Err(e) => println!("Cannot write card '{}/{}': {:?}", T::typ_str(), name, e),
-                        _ => (),
-                    }
-                });
+                let db = db.get()
+                    .expect("Cannot get DB connection");
+                match load_card_into_db::<T>(id, &db) {
+                    Err(e) => println!("Cannot write card '{}/{}': {:?}", T::typ_str(), name, e),
+                    _ => (),
+                }
             }
         }
 
@@ -190,7 +125,7 @@ fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
                         for path in event.paths.iter().filter(|p| is_json_file(p)) {
                             println!("Added card {}", path.to_str().unwrap());
                             if let Some(name) = path.file_stem() {
-                                add_card::<T>(String::from(name.to_str().unwrap()), Rc::clone(&db));
+                                add_card::<T>(String::from(name.to_str().unwrap()), db.clone());
                             };
                         }
                     },
@@ -203,16 +138,13 @@ fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
             Err(e) => println!("FSWatcher error happened: {}", e.to_string()),
         }
     })
-        .expect("can create file system watcher");
+        .expect("Cannot create file system watcher");
 
     watcher.watch(T::path().as_path(), RecursiveMode::NonRecursive)
-        .expect("can watch card directory");
-     */
+        .expect("Cannot watch card directory");
 
-    //FileWatcher { watcher }
     FileWatcher { watcher }
 }
-*/
 
 mod filters {
     use r2d2::Pool;
@@ -342,8 +274,13 @@ async fn main() {
     let pool = r2d2::Pool::new(manager)
         .expect("Cannot create DB connection pool");
 
-    init_db(pool.clone().get().expect("Cannot ").deref())
+    init_db(pool.clone().get().expect("Cannot get DB connection").deref())
         .expect("Cannot initialize DB");
+
+    let _project_watcher = init_watcher::<Project>(pool.clone());
+    let _task_watcher = init_watcher::<Task>(pool.clone());
+    let _status_watcher = init_watcher::<Status>(pool.clone());
+    let _timelog_watcher = init_watcher::<Timelog>(pool.clone());
 
     println!("   Done.");
 
