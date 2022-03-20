@@ -209,28 +209,28 @@ pub trait Card
         }
     }
 
-    fn sql_find_id(db: &rusqlite::Connection, nameOrId: &str) -> Result<u64, Error> {
-        fn get_next_id(rows: &mut rusqlite::Rows, nameOrId: &str) -> Result<u64, Error> {
+    fn sql_find_id(db: &rusqlite::Connection, name_or_id: &str) -> Result<u64, Error> {
+        fn get_next_id(rows: &mut rusqlite::Rows, name_or_id: &str) -> Result<u64, Error> {
             match rows.next() {
                 Err(err) => Err(Error::DatabaseError(err.to_string())),
-                Ok(None) => Err(Error::CantFindCard(String::from(nameOrId))),
+                Ok(None) => Err(Error::CantFindCard(String::from(name_or_id))),
                 Ok(Some(row)) => row.get::<usize, u64>(0).map_err(|err| Error::DatabaseError(err.to_string())),
             }
         }
-        if let Ok(id) = nameOrId.parse::<u64>() {
+        if let Ok(id) = name_or_id.parse::<u64>() {
             Ok(id)
         }
         else {
-            let mut stmt = db.prepare(&format!("SELECT id FROM Projects WHERE title LIKE '%{}%'", nameOrId))
+            let mut stmt = db.prepare(&format!("SELECT id FROM Projects WHERE title LIKE '%{}%'", name_or_id))
                 .map_err(|err| Error::DatabaseError(err.to_string()))?;
             let result = match stmt.query([]) {
                 Err(e) => Err(Error::DatabaseError(e.to_string())),
                 Ok(mut rows) => {
-                    let first = get_next_id(&mut rows, nameOrId);
-                    let second = get_next_id(&mut rows, nameOrId);
+                    let first = get_next_id(&mut rows, name_or_id);
+                    let second = get_next_id(&mut rows, name_or_id);
 
                     match (first, second) {
-                        (Ok(_), Ok(_)) => Err(Error::CantFindCard(format!("Name '{}/{}' is ambiguous", Self::typ_str(), nameOrId))),
+                        (Ok(_), Ok(_)) => Err(Error::CantFindCard(format!("Name '{}/{}' is ambiguous", Self::typ_str(), name_or_id))),
                         (f, _) => f
                     }
                 }

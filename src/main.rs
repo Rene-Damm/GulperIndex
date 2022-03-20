@@ -1,157 +1,20 @@
-// Fuck Rust...
-
-#[macro_use] extern crate rocket;
-
-use std::io::Cursor;
-use std::str::FromStr;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::thread;
-use notify::{RecursiveMode, Watcher};
+use std::ops::Deref;
+use std::path::{PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
+use notify::{Watcher};
 use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
-use rocket::{Rocket, Build, Request, Response, Orbit, Data, tokio};
-use rocket::fairing::{AdHoc, Fairing, Info};
-use rocket::futures::executor::block_on;
-use rocket_sync_db_pools::{database, rusqlite};
-use rocket::http::ContentType;
-use rocket::response::Responder;
+use r2d2_sqlite::SqliteConnectionManager;
+use warp::Filter;
 use crate::cards::{Card, Project, Task, Status, Timelog, CardType, get_path_to_cards};
-use crate::tokio::task::JoinHandle;
-
-#[database("sqlite_cards")]
-struct CardsDb(rusqlite::Connection);
 
 mod cards;
 
-struct IdList {
-    ids: Vec<u64>,
-}
-
-#[rocket::async_trait]
-impl<'r> Responder<'r, 'static> for IdList {
-    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
-
-        ////FIXME: this is probably the least efficient way possible to create a string of this size
-        let mut s = String::from("[");
-        let mut first = true;
-        for id in self.ids.iter() {
-            if !first {
-                s.push_str(",");
-            }
-            s.push_str(&id.to_string());
-            first = false;
-        }
-        s.push_str("]");
-
-        Response::build()
-            .header(ContentType::JSON)
-            .streamed_body(Cursor::new(s))
-            .ok()
-    }
-}
-
-// Lists.
-#[get("/project")]
-async fn get_project_list(db: CardsDb) -> IdList {
-    db.run(|c| {
-        IdList { ids: Project::sql_list_ids(&c).expect("can list project IDs") }
-    }).await
-}
-#[get("/task")]
-async fn get_task_list(db: CardsDb) -> IdList {
-    db.run(|c| {
-        IdList { ids: Task::sql_list_ids(&c).expect("can list task IDs") }
-    }).await
-}
-#[get("/status")]
-async fn get_status_list(db: CardsDb) -> IdList {
-    db.run(|c| {
-        IdList { ids: Status::sql_list_ids(&c).expect("can list status IDs") }
-    }).await
-}
-#[get("/timelog")]
-async fn get_timelog_list(db: CardsDb) -> IdList {
-    db.run(|c| {
-        IdList { ids: Timelog::sql_list_ids(&c).expect("can list timelog IDs") }
-    }).await
-}
-
-// Counts.
-#[get("/project/count")]
-async fn get_project_count(db: CardsDb) -> String {
-    db.run(|c| {
-        c.query_row(format!("SELECT COUNT(*) FROM {}", Project::sql_table()).as_str(), [],
-            |row| row.get::<usize, usize>(0))
-            .expect("can query project count").to_string()
-    }).await
-}
-#[get("/task/count")]
-async fn get_task_count(db: CardsDb) -> String {
-    db.run(|c| {
-        c.query_row(format!("SELECT COUNT(*) FROM {}", Task::sql_table()).as_str(), [],
-                    |row| row.get::<usize, usize>(0))
-            .expect("can query task count").to_string()
-    }).await
-}
-#[get("/status/count")]
-async fn get_status_count(db: CardsDb) -> String {
-    db.run(|c| {
-        c.query_row(format!("SELECT COUNT(*) FROM {}", Status::sql_table()).as_str(), [],
-                    |row| row.get::<usize, usize>(0))
-            .expect("can query status count").to_string()
-    }).await
-}
-#[get("/timelog/count")]
-async fn get_timelog_count(db: CardsDb) -> String {
-    db.run(|c| {
-        c.query_row(format!("SELECT COUNT(*) FROM {}", Timelog::sql_table()).as_str(), [],
-                    |row| row.get::<usize, usize>(0))
-            .expect("can query timelog count").to_string()
-    }).await
-}
-
-// Contents.
-async fn get_card<T: Card>(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
-    let name_or_id_str = String::from(nameOrId);
-    db.run(move |c| {
-        match T::sql_find_id(&c, &name_or_id_str) {
-            Ok(id) => {
-                match T::json(id) {
-                    Ok(s) => (rocket::http::Status::Ok, (ContentType::JSON, s)),
-                    Err(e) => (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
-                }
-            },
-            Err(cards::Error::CantFindCard(s)) =>
-                (rocket::http::Status::BadRequest, (ContentType::Text, format!("Cannot find {} '{}' ({})", T::typ_str(), &name_or_id_str, s))),
-            Err(e) =>
-                (rocket::http::Status::InternalServerError, (ContentType::Text, format!("{:?}", e)))
-        }
-    }).await
-}
-#[get("/project/<nameOrId>")]
-async fn get_project(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
-    get_card::<Project>(db, nameOrId).await
-}
-#[get("/task/<nameOrId>")]
-async fn get_task(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
-    get_card::<Task>(db, nameOrId).await
-}
-#[get("/status/<nameOrId>")]
-async fn get_status(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
-    get_card::<Status>(db, nameOrId).await
-}
-#[get("/timelog/<nameOrId>")]
-async fn get_timelog(db: CardsDb, nameOrId: &str) -> (rocket::http::Status, (ContentType, String)) {
-    get_card::<Timelog>(db, nameOrId).await
-}
-
-fn prepare_card_write_stmts<T: Card>(db: &mut rusqlite::Connection) -> Result<(rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
+fn prepare_card_write_stmts<T: Card>(db: &rusqlite::Connection) -> Result<(rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
     Ok((db.prepare(T::sql_write_stmt())?,
      db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")?))
 }
 
-fn load_card_into_db<T: Card>(id: u64, db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
+fn load_card_into_db<T: Card>(id: u64, db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
     let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
@@ -163,7 +26,7 @@ fn load_card_into_db<T: Card>(id: u64, db: &mut rusqlite::Connection) -> Result<
     Ok(())
 }
 
-fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
+fn load_all_cards_into_db<T: Card>(db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
     let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
@@ -177,59 +40,56 @@ fn load_all_cards_into_db<T: Card>(db: &mut rusqlite::Connection) -> Result<(), 
     Ok(())
 }
 
-fn populate_db_from_scratch(db: &mut rusqlite::Connection) -> Result<(), cards::Error> {
+fn populate_db_from_scratch(db: &rusqlite::Connection) -> Result<(), cards::Error> {
     load_all_cards_into_db::<Project>(db)?;
     load_all_cards_into_db::<Task>(db)?;
     load_all_cards_into_db::<Status>(db)?;
     load_all_cards_into_db::<Timelog>(db)
 }
 
-async fn init_db(rocket: Rocket<Build>) -> Rocket<Build> {
+fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
     // For now, rebuild from scratch every time.
-    CardsDb::get_one(&rocket).await
-        .expect("database mounted")
-        .run(|db| {
-            let stmt = format!(r#"
-                BEGIN;
-                DROP TABLE IF EXISTS Tags;
-                DROP TABLE IF EXISTS Taggings;
-                DROP TABLE IF EXISTS Links;
-                CREATE TABLE IF NOT EXISTS Tags (
-                    id INTEGER PRIMARY KEY UNIQUE,
-                    text VARCHAR NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS Taggings (
-                    id INTEGER PRIMARY KEY UNIQUE,
-                    tag_id INTEGER,
-                    card_type INTEGER,
-                    card_id INTEGER
-                );
-                CREATE TABLE IF NOT EXISTS Links (
-                    id INTEGER PRIMARY KEY UNIQUE,
-                    role VARCHAR,
-                    from_type INTEGER,
-                    from_id INTEGER,
-                    to_type INTEGER,
-                    to_id INTEGER
-                );
-                {}
-                {}
-                {}
-                {}
-                COMMIT;"#,
-               Project::sql_schema(), Task::sql_schema(), Status::sql_schema(), Timelog::sql_schema());
+    let stmt = format!(r#"
+        BEGIN;
+        DROP TABLE IF EXISTS Tags;
+        DROP TABLE IF EXISTS Taggings;
+        DROP TABLE IF EXISTS Links;
+        CREATE TABLE IF NOT EXISTS Tags (
+            id INTEGER PRIMARY KEY UNIQUE,
+            text VARCHAR NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS Taggings (
+            id INTEGER PRIMARY KEY UNIQUE,
+            tag_id INTEGER,
+            card_type INTEGER,
+            card_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS Links (
+            id INTEGER PRIMARY KEY UNIQUE,
+            role VARCHAR,
+            from_type INTEGER,
+            from_id INTEGER,
+            to_type INTEGER,
+            to_id INTEGER
+        );
+        {}
+        {}
+        {}
+        {}
+        COMMIT;"#,
+                       Project::sql_schema(),
+                       Task::sql_schema(),
+                       Status::sql_schema(),
+                       Timelog::sql_schema());
 
-            db.execute_batch(&stmt,)
-                .expect("can init DB");
+    db.execute_batch(&stmt,)
+        .map_err(|err| { cards::Error::DatabaseError(err.to_string())})?;
 
-            populate_db_from_scratch(db)
-                .expect("can load cards into DB")
-        }).await;
-
-    rocket
+    populate_db_from_scratch(db)
 }
 
+/*
 enum FileChange {
     Added(String),
     Removed(String),
@@ -352,38 +212,147 @@ fn init_file_watcher<T: Card>(db: CardsDb) -> FileWatcher {
     //FileWatcher { watcher }
     FileWatcher { watcher }
 }
+*/
 
-#[launch]
-fn rocket() -> _ {
+mod filters {
+    use r2d2::Pool;
+    use r2d2_sqlite::SqliteConnectionManager;
+    use super::handlers;
+    use warp::Filter;
+    use crate::Card;
 
-    let db_init = AdHoc::on_ignite("Rusqlite Stage", |rocket| async {
-        rocket
-            .attach(CardsDb::fairing())
-            .attach(AdHoc::on_ignite("Rusqlite Init", init_db))
-            //.attach(AdHoc::on_ignite("FSWatch Projects", init_file_watcher::<Project>))
-            .attach(AdHoc::on_ignite("FSWatch Projects", |rocket| async {
-                let db = CardsDb::get_one(&rocket).await.expect("can get connection to DB");
-                //let dbRef = Rc::new(db);
-                rocket
-                    .attach(init_file_watcher::<Project>(db))
-                    //.attach(init_file_watcher::<Task>(Rc::clone(&dbRef)))
-            }))
-    });
+    pub fn cards<T: Card>(db: Pool<SqliteConnectionManager>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        count::<T>(db.clone())
+            .or(list::<T>(db.clone()))
+            .or(get::<T>(db.clone()))
+    }
 
-    rocket::build()
-        .attach(db_init)
-        .mount("/", routes![
-            get_project_list, get_project_count, get_project,
-            get_task_list, get_task_count, get_task,
-            get_status_list, get_status_count, get_status,
-            get_timelog_list, get_timelog_count, get_timelog,
-        ])
+    pub fn count<T: Card>(db: Pool<SqliteConnectionManager>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        warp::path(T::typ_str())
+            .and(warp::path("count"))
+            .and(warp::path::end())
+            .and(warp::get())
+            .and(with_db(db))
+            .and_then(handlers::count::<T>)
+    }
+
+    pub fn list<T: Card>(db: Pool<SqliteConnectionManager>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        warp::path(T::typ_str())
+            .and(warp::path::end())
+            .and(warp::get())
+            .and(with_db(db))
+            .and_then(handlers::list::<T>)
+    }
+
+    pub fn get<T: Card>(db: Pool<SqliteConnectionManager>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        warp::path(T::typ_str())
+            .and(warp::path::param())
+            .and(warp::path::end())
+            .and(warp::get())
+            .and(with_db(db))
+            .and_then(handlers::get::<T>)
+    }
+
+    fn with_db(db: Pool<SqliteConnectionManager>) -> impl Filter<Extract = (Pool<SqliteConnectionManager>,), Error = std::convert::Infallible> + Clone {
+        warp::any().map(move || db.clone())
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+mod handlers {
+    use std::convert::Infallible;
+    use r2d2::Pool;
+    use r2d2_sqlite::SqliteConnectionManager;
+    use warp::http::{HeaderValue, StatusCode};
+    use warp::http::header::CONTENT_TYPE;
+    use warp::Reply;
+    use warp::reply::Response;
+    use crate::{Card, cards};
+
+    pub async fn count<T: Card>(db: Pool<SqliteConnectionManager>) -> Result<impl warp::Reply, Infallible> {
+
+        let db = db.get()
+            .expect("Cannot get DB connection from pool");
+
+        let count = db.query_row(format!("SELECT COUNT(*) FROM {}", T::sql_table()).as_str(), [],
+                     |row| row.get::<usize, usize>(0))
+            .expect("Cannot query project count");
+
+        Ok(warp::reply::json(&count))
     }
+
+    pub async fn list<T: Card>(db: Pool<SqliteConnectionManager>) -> Result<impl warp::Reply, Infallible> {
+
+        let db = db.get()
+            .expect("Cannot get DB connection from pool");
+
+        let ids = T::sql_list_ids(&db)
+            .expect("can list task IDs");
+
+        Ok(warp::reply::json(&ids))
+    }
+
+    struct Json {
+        inner: Result<Vec<u8>, ()>,
+    }
+
+    impl Reply for Json {
+        #[inline]
+        fn into_response(self) -> Response {
+            match self.inner {
+                Ok(body) => {
+                    let mut res = Response::new(body.into());
+                    res.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    res
+                }
+                Err(()) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+    }
+
+    pub async fn get<T: Card>(name_or_id: String, db: Pool<SqliteConnectionManager>) -> Result<impl warp::Reply, Infallible> {
+
+        let db = db.get()
+            .expect("Cannot get DB connection from pool");
+
+        let (s, code) = match T::sql_find_id(&db, &name_or_id) {
+            Ok(id) => {
+                match T::json(id) {
+                    Ok(s) => (s, StatusCode::OK),
+                    Err(e) => (format!("Could not load {}: {:?}", name_or_id, e), StatusCode::INTERNAL_SERVER_ERROR),
+                }
+            },
+            Err(cards::Error::CantFindCard(e)) => (format!("Cannot find card {}", e), StatusCode::NOT_FOUND),
+            Err(e) => (format!("Error: {:?}", e), StatusCode::INTERNAL_SERVER_ERROR),
+        };
+
+        // T::json gives us a string that is already serialized JSON data.
+        Ok(warp::reply::with_status(Json { inner: Ok(s.into_bytes()) }, code))
+    }
+}
+
+mod watcher {
+}
+
+#[tokio::main]
+async fn main() {
+
+    println!("Initializing database...");
+    let manager = SqliteConnectionManager::file("cards.sqlite");
+    let pool = r2d2::Pool::new(manager)
+        .expect("Cannot create DB connection pool");
+
+    init_db(pool.clone().get().expect("Cannot ").deref())
+        .expect("Cannot initialize DB");
+
+    println!("   Done.");
+
+    let api = filters::cards::<Project>(pool.clone())
+        .or(filters::cards::<Task>(pool.clone()))
+        .or(filters::cards::<Status>(pool.clone()))
+        .or(filters::cards::<Timelog>(pool.clone()));
+
+    warp::serve(api)
+        .run(([127, 0, 0, 1], 8000))
+        .await;
 }
