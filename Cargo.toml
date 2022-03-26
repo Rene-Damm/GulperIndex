@@ -14,3 +14,4 @@ warp = "0.3"
 rusqlite = { versio = "0.25.0", features = ["bundled"] }
 r2d2 = "0.8.9"
 r2d2_sqlite = "0.20.0"
+urlencoding = "2.1.0"

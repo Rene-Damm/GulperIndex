@@ -1,14 +1,38 @@
 use std::ops::Deref;
 use std::path::{PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
 use notify::{RecursiveMode, Watcher};
-use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{RemoveKind};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
-use crate::cards::{Card, Project, Task, Status, Timelog, CardType, get_path_to_cards};
+use crate::cards::{Card, Project, Task, Status, Timelog};
+
+////TODO: store cards.sqlite in a place where other tools can access it
 
 mod cards;
+
+fn remove_card_from_db<T: Card>(id: u64, db: &rusqlite::Connection, include_incoming_links: bool) -> Result<(), cards::Error> {
+
+    let mut del_card_stmt = db.prepare(&format!("DELETE FROM {} WHERE id IS {}", T::sql_table(), id))
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
+    let mut del_links_stmt = if include_incoming_links {
+        db.prepare(&format!("DELETE FROM Links WHERE (from_type IS {} AND from_id IS {}) OR (to_type IS {} AND to_id IS {})",
+                            T::typ() as u32, id,
+                            T::typ() as u32, id))
+    } else {
+        db.prepare(&format!("DELETE FROM Links WHERE from_type IS {} AND from_id IS {}",
+                            T::typ() as u32, id))
+    }
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
+    del_card_stmt.execute([])
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+    del_links_stmt.execute([])
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
+    Ok(())
+}
 
 fn prepare_card_write_stmts<T: Card>(db: &rusqlite::Connection) -> Result<(rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
     Ok((db.prepare(T::sql_write_stmt())?,
@@ -90,9 +114,7 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
     populate_db_from_scratch(db)
 }
 
-struct FileWatcher {
-    watcher: notify::RecommendedWatcher,
-}
+struct FileWatcher(notify::RecommendedWatcher);
 
 fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
 
@@ -111,10 +133,48 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
             if let Ok(id) = name.parse::<u64>() {
                 let db = db.get()
                     .expect("Cannot get DB connection");
+                db.execute("BEGIN TRANSACTION", [])
+                    .expect("Cannot begin transaction");
                 match load_card_into_db::<T>(id, &db) {
                     Err(e) => println!("Cannot write card '{}/{}': {:?}", T::typ_str(), name, e),
                     _ => (),
                 }
+                db.execute("COMMIT", [])
+                    .expect("Cannot commit transaction");
+            }
+        }
+
+        fn remove_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>, include_incoming_links: bool) {
+            if let Ok(id) = name.parse::<u64>() {
+                let db = db.get()
+                    .expect("Cannot get DB connection");
+                db.execute("BEGIN TRANSACTION", [])
+                    .expect("Cannot begin transaction");
+                match remove_card_from_db::<T>(id, &db, include_incoming_links) {
+                    Err(e) => println!("Cannot remove card '{}/{}': {:?}", T::typ_str(), name, e),
+                    _ => (),
+                }
+                db.execute("COMMIT", [])
+                    .expect("Cannot commit transaction");
+            }
+        }
+
+        fn update_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>) {
+            if let Ok(id) = name.parse::<u64>() {
+                let db = db.get()
+                    .expect("Cannot get DB connection");
+                db.execute("BEGIN TRANSACTION", [])
+                    .expect("Cannot begin transaction");
+                match remove_card_from_db::<T>(id, &db, false) {
+                    Err(e) => println!("Cannot remove card '{}/{}': {:?}", T::typ_str(), name, e),
+                    _ => (),
+                }
+                match load_card_into_db::<T>(id, &db) {
+                    Err(e) => println!("Cannot write card '{}/{}': {:?}", T::typ_str(), name, e),
+                    _ => (),
+                }
+                db.execute("COMMIT", [])
+                    .expect("Cannot commit transaction");
             }
         }
 
@@ -129,9 +189,25 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                             };
                         }
                     },
-                    notify::EventKind::Remove(RemoveKind::File) => {},
-                    notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)) => {},
-                    notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {},
+                    notify::EventKind::Remove(_) => {
+                        for path in event.paths.iter().filter(|p| is_json_file(p)) {
+                            println!("Removed card {}", path.to_str().unwrap());
+                            if let Some(name) = path.file_stem() {
+                                ////FIXME: *If* the file comes *back* we have destroyed all incoming links and they are gone.
+                                ////       (should we leave incoming links in the DB?)
+                                remove_card::<T>(String::from(name.to_str().unwrap()), db.clone(), true);
+                            };
+                        }
+                    },
+                    notify::EventKind::Modify(_) => {
+                        ////FIXME: Getting two notifications for every single change.
+                        for path in event.paths.iter().filter(|p| is_json_file(p)) {
+                            println!("Modified card {}", path.to_str().unwrap());
+                            if let Some(name) = path.file_stem() {
+                                update_card::<T>(String::from(name.to_str().unwrap()), db.clone());
+                            };
+                        }
+                    },
                     _ => {}, // Ignore
                 }
             }
@@ -143,10 +219,11 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
     watcher.watch(T::path().as_path(), RecursiveMode::NonRecursive)
         .expect("Cannot watch card directory");
 
-    FileWatcher { watcher }
+    FileWatcher(watcher)
 }
 
 mod filters {
+    use std::collections::HashMap;
     use r2d2::Pool;
     use r2d2_sqlite::SqliteConnectionManager;
     use super::handlers;
@@ -172,6 +249,7 @@ mod filters {
         warp::path(T::typ_str())
             .and(warp::path::end())
             .and(warp::get())
+            .and(warp::query::<HashMap<String, String>>())
             .and(with_db(db))
             .and_then(handlers::list::<T>)
     }
@@ -191,6 +269,7 @@ mod filters {
 }
 
 mod handlers {
+    use std::collections::HashMap;
     use std::convert::Infallible;
     use r2d2::Pool;
     use r2d2_sqlite::SqliteConnectionManager;
@@ -212,13 +291,13 @@ mod handlers {
         Ok(warp::reply::json(&count))
     }
 
-    pub async fn list<T: Card>(db: Pool<SqliteConnectionManager>) -> Result<impl warp::Reply, Infallible> {
+    pub async fn list<T: Card>(query: HashMap<String, String>, db: Pool<SqliteConnectionManager>) -> Result<impl warp::Reply, Infallible> {
 
         let db = db.get()
             .expect("Cannot get DB connection from pool");
 
-        let ids = T::sql_list_ids(&db)
-            .expect("can list task IDs");
+        let ids = T::sql_list_ids(&db, &query)
+            .expect("Cannot list card IDs");
 
         Ok(warp::reply::json(&ids))
     }
@@ -254,16 +333,13 @@ mod handlers {
                     Err(e) => (format!("Could not load {}: {:?}", name_or_id, e), StatusCode::INTERNAL_SERVER_ERROR),
                 }
             },
-            Err(cards::Error::CantFindCard(e)) => (format!("Cannot find card {}", e), StatusCode::NOT_FOUND),
+            Err(cards::Error::CantFindCard(e)) => (format!("Cannot find card: {}", e), StatusCode::NOT_FOUND),
             Err(e) => (format!("Error: {:?}", e), StatusCode::INTERNAL_SERVER_ERROR),
         };
 
         // T::json gives us a string that is already serialized JSON data.
         Ok(warp::reply::with_status(Json { inner: Ok(s.into_bytes()) }, code))
     }
-}
-
-mod watcher {
 }
 
 #[tokio::main]

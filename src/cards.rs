@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::params;
+use urlencoding::decode;
 
 ////TODO: simply make the table name match typ_str()
 
@@ -57,8 +59,8 @@ pub fn get_path_to_cards() -> PathBuf {
 
 pub fn parse_qualified_id(qualified_id: &str) -> Result<(CardType, u64), Error> {
     let slash = qualified_id.find('/').ok_or(Error::DatabaseError(String::from("card link is missing /")))?;
-    let typ = CardType::from_str(&qualified_id[..slash]).map_err(|err| Error::DatabaseError(String::from("invalid card type")))?;
-    let id = qualified_id[(slash + 1)..].parse::<u64>().map_err(|err| Error::DatabaseError(String::from("invalid card ID")))?;
+    let typ = CardType::from_str(&qualified_id[..slash]).map_err(|_| Error::DatabaseError(String::from("invalid card type")))?;
+    let id = qualified_id[(slash + 1)..].parse::<u64>().map_err(|_| Error::DatabaseError(String::from("invalid card ID")))?;
 
     Ok((typ, id))
 }
@@ -95,8 +97,8 @@ fn get_optional_property<T: FromStr>(json: &serde_json::Value, name: &str) -> Re
 fn get_bool_property(json: &serde_json::Value, name: &str) -> Result<bool, Error> {
     match &json[name] {
         serde_json::Value::Null => Ok(false),
-        serde_json::Value::Bool(b) => Ok(false),
-        serde_json::Value::String(s) => s.parse::<bool>().map_err(|err| Error::CantReadProperty(String::from(name))),
+        serde_json::Value::Bool(b) => Ok(*b),
+        serde_json::Value::String(s) => s.parse::<bool>().map_err(|_| Error::CantReadProperty(String::from(name))),
         _ => Err(Error::CantReadProperty(String::from(name)))
     }
 }
@@ -187,7 +189,7 @@ pub trait Card
                     }
                     if let Some(stem) = path.file_stem() {
                         if let Ok(id) = stem.to_str().unwrap().parse::<u64>() {
-                            if let Ok(file_type) = entry.file_type() {
+                            if let Ok(_) = entry.file_type() {
                                 result.push(id)
                             }
                         }
@@ -239,8 +241,22 @@ pub trait Card
         }
     }
 
-    fn sql_list_ids(db: &rusqlite::Connection) -> Result<Vec<u64>, Error> {
-        let mut stmt = db.prepare(format!("SELECT id FROM {}", Self::sql_table()).as_str())
+    fn sql_list_ids(db: &rusqlite::Connection, query: &HashMap<String, String>) -> Result<Vec<u64>, Error> {
+
+        let mut stmt_str = format!("SELECT id FROM {}", Self::sql_table());
+        if !query.is_empty() {
+            if query.len() == 1 && query.iter().next().unwrap().0 == "_where" {
+                stmt_str.push_str(&format!(" WHERE {}", decode(query.iter().next().unwrap().1).unwrap()))
+            }
+            else {
+                for (key, value) in query.iter() {
+                    ////REVIEW: stringify automatically?
+                    stmt_str.push_str(&format!(" WHERE {} IS {}", key, decode(value).unwrap()))
+                }
+            }
+        }
+
+        let mut stmt = db.prepare(stmt_str.as_str())
             .map_err(|err| Error::DatabaseError(err.to_string()))?;
         let mut rows = stmt.query([])
             .map_err(|err| Error::DatabaseError(err.to_string()))?;
