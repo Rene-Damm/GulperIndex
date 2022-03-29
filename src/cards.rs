@@ -280,7 +280,6 @@ pub trait Card
                 Some(index) => &v[(index + 1)..],
                 None => &v[..],
             };
-            let slash = qualified_id.find('/').ok_or(Error::DatabaseError(String::from("card link is missing /")))?;
             let (to_type, to_id) = parse_qualified_id(qualified_id)?;
 
             db.insert(params![
@@ -290,6 +289,23 @@ pub trait Card
                 to_type as u32,
                 to_id,
             ]).map_err(|err| Error::DatabaseError(String::from(format!("cannot insert link: {}", err.to_string()))))?;
+        }
+        Ok(())
+    }
+
+    fn sql_write_tags(&self, tag_insert: &mut rusqlite::Statement, tag_lookup: &mut rusqlite::Statement, tagging_insert: &mut rusqlite::Statement) -> Result<(), Error> {
+        for tag in self.tags() {
+            tag_insert.execute(params![tag])
+                .map_err(|err| Error::DatabaseError(String::from(format!("cannot insert tag: {}", err.to_string()))))?;
+            let tag_id = tag_lookup.query_row(params![tag],
+                |row| row.get::<usize, usize>(0))
+                .map_err(|err| Error::DatabaseError(String::from(format!("cannot query tag: {}", err.to_string()))))?;
+
+            tagging_insert.insert(params![
+                tag_id,
+                Self::typ() as u32,
+                self.id()
+            ]).map_err(|err| Error::DatabaseError(String::from(format!("cannot insert tagging: {}", err.to_string()))))?;
         }
         Ok(())
     }
@@ -303,8 +319,8 @@ pub struct Project {
     tags: Vec<String>,
     links: Vec<String>,
     active: bool,
-    started: Option<NaiveDate>,
-    finished: Option<NaiveDate>,
+    started: Option<String>,
+    finished: Option<String>,
 }
 
 impl Card for Project {
@@ -357,8 +373,8 @@ impl Card for Project {
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
 
-        let started = self.started.map_or(String::from("NULL"), |d| d.to_string());
-        let finished = self.finished.map_or(String::from("NULL"), |d| d.to_string());
+        let started = self.started.as_ref().map_or(String::from("NULL"), |d| d.to_string());
+        let finished = self.finished.as_ref().map_or(String::from("NULL"), |d| d.to_string());
         let created = self.created.to_rfc3339();
         let modified = self.modified.to_rfc3339();
 

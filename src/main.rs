@@ -1,7 +1,6 @@
 use std::ops::Deref;
 use std::path::{PathBuf};
 use notify::{RecursiveMode, Watcher};
-use notify::event::{RemoveKind};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
@@ -26,41 +25,58 @@ fn remove_card_from_db<T: Card>(id: u64, db: &rusqlite::Connection, include_inco
     }
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
 
+    let mut del_tags_stmt = db.prepare(&format!("DELETE FROM Taggings WHERE card_type IS {} AND card_id IS {}", T::typ() as u32, id))
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
     del_card_stmt.execute([])
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
     del_links_stmt.execute([])
+        .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+    del_tags_stmt.execute([])
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
 
     Ok(())
 }
 
-fn prepare_card_write_stmts<T: Card>(db: &rusqlite::Connection) -> Result<(rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
+fn prepare_card_write_stmts<T: Card>(db: &rusqlite::Connection)
+    -> Result<(rusqlite::Statement, rusqlite::Statement, rusqlite::Statement, rusqlite::Statement, rusqlite::Statement), rusqlite::Error> {
     Ok((db.prepare(T::sql_write_stmt())?,
-     db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")?))
+        db.prepare("INSERT INTO Links (role, from_type, from_id, to_type, to_id) VALUES(?1, ?2, ?3, ?4, ?5)")?,
+        db.prepare("INSERT OR IGNORE INTO Tags VALUES(?1)")?,
+        db.prepare("SELECT rowid FROM Tags WHERE name IS ?1")?,
+        db.prepare("INSERT INTO Taggings (tag_id, card_type, card_id) VALUES(?1, ?2, ?3)")?))
 }
 
 fn load_card_into_db<T: Card>(id: u64, db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
-    let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
+    let (mut sql, mut link, mut tag_insert, mut tag_lookup, mut tagging_insert) = prepare_card_write_stmts::<T>(db)
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
 
     let card = T::load(id)?;
     card.sql_write(&mut sql)?;
     card.sql_write_links(&mut link)?;
+    card.sql_write_tags(&mut tag_insert, &mut tag_lookup, &mut tagging_insert)?;
 
     Ok(())
 }
 
 fn load_all_cards_into_db<T: Card>(db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
-    let (mut sql, mut link) = prepare_card_write_stmts::<T>(db)
+    let (mut sql, mut link, mut tag_insert, mut tag_lookup, mut tagging_insert) = prepare_card_write_stmts::<T>(db)
         .map_err(|err| cards::Error::DatabaseError(err.to_string()))?;
+
+    db.execute("BEGIN TRANSACTION", [])
+        .expect("Cannot begin transaction");
 
     for id in T::list() {
         let card = T::load(id)?;
         card.sql_write(&mut sql)?;
         card.sql_write_links(&mut link)?;
+        card.sql_write_tags(&mut tag_insert, &mut tag_lookup, &mut tagging_insert)?;
     }
+
+    db.execute("COMMIT", [])
+        .expect("Cannot commit transaction");
 
     Ok(())
 }
@@ -81,17 +97,14 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
         DROP TABLE IF EXISTS Taggings;
         DROP TABLE IF EXISTS Links;
         CREATE TABLE IF NOT EXISTS Tags (
-            id INTEGER PRIMARY KEY UNIQUE,
-            text VARCHAR NOT NULL
+            name VARCHAR PRIMARY KEY UNIQUE
         );
         CREATE TABLE IF NOT EXISTS Taggings (
-            id INTEGER PRIMARY KEY UNIQUE,
             tag_id INTEGER,
             card_type INTEGER,
             card_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS Links (
-            id INTEGER PRIMARY KEY UNIQUE,
             role VARCHAR,
             from_type INTEGER,
             from_id INTEGER,
