@@ -6,6 +6,26 @@ use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
 use crate::cards::{Card, Project, Task, Status, Timelog};
 
+// API:
+// GET /<type>                  u64 list of cards of the given type
+// GET /<type>?prop=val...      u64 list of cards of the given type that have the given property values
+// GET /<type>?_where=q         u64 list of cards of the given type that match the given SQL query
+// GET /<type>/count            u64 count of the number of cards of the given type
+// GET /<type>/<id>             JSON object containing the contents of the given card
+// GET /<type>/<str>            Same as by ID but tries to look up a card by the given fragment of its title
+//
+// Choices:
+// - Exposing SQL directly; gives access to full-fledged query language at the expense of tying us to implementation details
+//
+// Missing
+// - Looking up card(s) by tag
+// - Looking up card(s) by links
+// - Looking up cards of mixed types
+//
+// Explore
+// - Using an external SQL DB on the system for storage such that the DB is visible/accessible
+//   to everyone without going through gulper_index
+
 ////TODO: store cards.sqlite in a place where other tools can access it
 
 mod cards;

@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use chrono::{DateTime, NaiveDate, Utc};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use urlencoding::decode;
 
 ////TODO: simply make the table name match typ_str()
+////TODO: introduce CardId type (pub struct CardId(u64))
+////TODO: lowercase all table names
 
-#[derive(Copy, Clone, PartialEq)]
 pub enum CardType {
     Invalid,
     Project,
@@ -138,8 +138,8 @@ fn load_card_from_json<T: Card, F: FnOnce(CardData) -> Result<T, Error>>(id: u64
 struct CardData {
     id: u64,
     title: String,
-    created: DateTime<Utc>,
-    modified: DateTime<Utc>,
+    created: String,
+    modified: String,
     tags: Vec<String>,
     links: Vec<String>,
     contents: serde_json::Value,
@@ -150,8 +150,8 @@ pub trait Card
 
     fn id(&self) -> u64;
     fn title(&self) -> &String;
-    fn created(&self) -> DateTime<Utc>;
-    fn modified(&self) -> DateTime<Utc>;
+    fn created(&self) -> &String;
+    fn modified(&self) -> &String;
     fn tags(&self) -> std::slice::Iter<'_, String>;
     fn links(&self) -> std::slice::Iter<'_, String>;
 
@@ -243,16 +243,61 @@ pub trait Card
 
     fn sql_list_ids(db: &rusqlite::Connection, query: &HashMap<String, String>) -> Result<Vec<u64>, Error> {
 
+        let mut tags = Vec::new();
+        let mut ids = Vec::new();
+
         let mut stmt_str = format!("SELECT id FROM {}", Self::sql_table());
+        let mut have_where_clause = false;
         if !query.is_empty() {
             if query.len() == 1 && query.iter().next().unwrap().0 == "_where" {
-                stmt_str.push_str(&format!(" WHERE {}", decode(query.iter().next().unwrap().1).unwrap()))
+                stmt_str.push_str(&format!(" WHERE {}", decode(query.iter().next().unwrap().1).unwrap()));
+                have_where_clause = true;
             }
             else {
                 for (key, value) in query.iter() {
-                    ////REVIEW: stringify automatically?
-                    stmt_str.push_str(&format!(" WHERE {} IS {}", key, decode(value).unwrap()))
+                    if key == "tag" {
+                        tags.push(value)
+                    } else {
+                        ////REVIEW: stringify automatically?
+                        stmt_str.push_str(&format!(" WHERE {} IS {}", key, decode(value).unwrap()));
+                        have_where_clause = true;
+                    }
                 }
+            }
+        }
+
+        // Look up all tag IDs.
+        let mut tag_ids = Vec::new();
+        if !tags.is_empty() {
+            let mut tag_lookup = db.prepare("SELECT rowid FROM Tags WHERE name LIKE ?1")
+                .map_err(|err| Error::DatabaseError(err.to_string()))?;
+            for tag in tags.iter() {
+                let id = tag_lookup.query_row(params![*tag],
+                    |row| row.get::<usize, u64>(0))
+                    .optional()
+                    .map_err(|err| Error::DatabaseError(err.to_string()))?;
+
+                match id {
+                    Some(i) => tag_ids.push(i),
+                    _ => ()
+                }
+            }
+
+            // If we have tag constraints but none of the tags resulted in any hit,
+            // our result set is empty so early out.
+            if tag_ids.is_empty() {
+                return Ok(ids)
+            }
+        }
+
+        // If we are searching by tags, append lookup for Taggings table.
+        if !tag_ids.is_empty() {
+            for tag_id in tag_ids.iter() {
+                stmt_str = format!("{} {} id IN (SELECT card_id FROM Taggings WHERE tag_id IS {} AND card_type IS {})",
+                                   stmt_str, if have_where_clause { "AND" } else { "WHERE" },
+                    tag_id, Self::typ() as u32
+                );
+                have_where_clause = true;
             }
         }
 
@@ -261,7 +306,6 @@ pub trait Card
         let mut rows = stmt.query([])
             .map_err(|err| Error::DatabaseError(err.to_string()))?;
 
-        let mut ids = Vec::new();
         while let Some(row) = rows.next().map_err(|err| Error::DatabaseError(err.to_string()))? {
             ids.push(row.get::<usize, u64>(0).map_err(|err| Error::DatabaseError(err.to_string()))?)
         }
@@ -314,8 +358,8 @@ pub trait Card
 pub struct Project {
     id: u64,
     title: String,
-    created: DateTime<Utc>,
-    modified: DateTime<Utc>,
+    created: String,
+    modified: String,
     tags: Vec<String>,
     links: Vec<String>,
     active: bool,
@@ -327,8 +371,8 @@ impl Card for Project {
 
     fn id(&self) -> u64 { self.id }
     fn title(&self) -> &String { &self.title }
-    fn created(&self) -> DateTime<Utc> { self.created }
-    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Project }
@@ -356,10 +400,10 @@ impl Card for Project {
         CREATE TABLE Projects (
             id INTEGER PRIMARY KEY,
             title VARCHAR NOT NULL,
-            created VARCHAR NOT NULL,
-            modified VARCHAR NOT NULL,
-            started VARCHAR,
-            finished VARCHAR,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            started DATETIME,
+            finished DATETIME,
             active BOOLEAN DEFAULT 1
         );
         CREATE INDEX ProjectsByName ON Projects(title);"#
@@ -373,10 +417,10 @@ impl Card for Project {
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
 
-        let started = self.started.as_ref().map_or(String::from("NULL"), |d| d.to_string());
-        let finished = self.finished.as_ref().map_or(String::from("NULL"), |d| d.to_string());
-        let created = self.created.to_rfc3339();
-        let modified = self.modified.to_rfc3339();
+        let started = &self.started.as_ref().map_or(String::new(), |d| d.to_string());
+        let finished = &self.finished.as_ref().map_or(String::new(), |d| d.to_string());
+        let created = &self.created;
+        let modified = &self.modified;
 
         stmt.execute(params![
             self.id,
@@ -393,20 +437,20 @@ impl Card for Project {
 pub struct Task {
     id: u64,
     description: String,
-    created: DateTime<Utc>,
-    modified: DateTime<Utc>,
+    created: String,
+    modified: String,
     tags: Vec<String>,
     links: Vec<String>,
     obsolete: bool,
-    completed: Option<NaiveDate>,
+    completed: Option<String>,
 }
 
 impl Card for Task {
 
     fn id(&self) -> u64 { self.id }
     fn title(&self) -> &String { &self.description }
-    fn created(&self) -> DateTime<Utc> { self.created }
-    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Task }
@@ -433,9 +477,9 @@ impl Card for Task {
         CREATE TABLE Tasks (
             id INTEGER PRIMARY KEY,
             title VARCHAR NOT NULL,
-            created VARCHAR NOT NULL,
-            modified VARCHAR NOT NULL,
-            completed VARCHAR,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            completed DATETIME,
             obsolete BOOLEAN
         );
         CREATE INDEX TasksByDescription ON Tasks(title);"#
@@ -449,9 +493,9 @@ impl Card for Task {
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
 
-        let completed = self.completed.map_or(String::from("NULL"), |d| d.to_string());
-        let created = self.created.to_rfc3339();
-        let modified = self.modified.to_rfc3339();
+        let completed = &self.completed.as_ref().map_or(String::new(), |d| d.to_string());
+        let created = &self.created;
+        let modified = &self.modified;
 
         stmt.execute(params![
             self.id,
@@ -466,13 +510,13 @@ impl Card for Task {
 
 pub struct Timelog {
     id: u64,
-    created: DateTime<Utc>,
-    modified: DateTime<Utc>,
+    created: String,
+    modified: String,
     tags: Vec<String>,
     links: Vec<String>,
     description: String,
-    started: DateTime<Utc>,
-    ended: Option<DateTime<Utc>>,
+    started: String,
+    ended: Option<String>,
     category: Option<String>,
 }
 
@@ -480,8 +524,8 @@ impl Card for Timelog {
 
     fn id(&self) -> u64 { self.id }
     fn title(&self) -> &String { &self.description }
-    fn created(&self) -> DateTime<Utc> { self.created }
-    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Timelog }
@@ -508,10 +552,10 @@ impl Card for Timelog {
         CREATE TABLE Timelogs (
             id INTEGER PRIMARY KEY,
             title VARCHAR NOT NULL,
-            created VARCHAR NOT NULL,
-            modified VARCHAR NOT NULL,
-            started VARCHAR NOT NULL,
-            ended VARCHAR,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            started DATETIME NOT NULL,
+            ended DATETIME,
             category VARCHAR
         );"#
     }
@@ -524,10 +568,10 @@ impl Card for Timelog {
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
 
-        let started = self.started.to_string();
-        let ended = self.ended.map_or(String::from("NULL"), |d| d.to_string());
-        let created = self.created.to_rfc3339();
-        let modified = self.modified.to_rfc3339();
+        let started = &self.started;
+        let ended = &self.ended.as_ref().map_or(String::new(), |d| d.to_string());
+        let created = &self.created;
+        let modified = &self.modified;
 
         stmt.execute(params![
             self.id,
@@ -541,27 +585,23 @@ impl Card for Timelog {
     }
 }
 
-pub struct Transaction {
-    id: u64,
-}
-
 pub struct Status {
     id: u64,
-    created: DateTime<Utc>,
-    modified: DateTime<Utc>,
+    created: String,
+    modified: String,
     tags: Vec<String>,
     links: Vec<String>,
     message: String,
-    began: Option<DateTime<Utc>>,
-    ended: Option<DateTime<Utc>>,
+    began: Option<String>,
+    ended: Option<String>,
 }
 
 impl Card for Status {
 
     fn id(&self) -> u64 { self.id }
     fn title(&self) -> &String { &self.message }
-    fn created(&self) -> DateTime<Utc> { self.created }
-    fn modified(&self) -> DateTime<Utc> { self.modified }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Status }
@@ -587,10 +627,10 @@ impl Card for Status {
         CREATE TABLE Statuses (
             id INTEGER PRIMARY KEY,
             title VARCHAR NOT NULL,
-            created VARCHAR NOT NULL,
-            modified VARCHAR NOT NULL,
-            began VARCHAR,
-            ended VARCHAR
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            began DATETIME,
+            ended DATETIME
         );"#
     }
 
@@ -602,10 +642,10 @@ impl Card for Status {
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
 
-        let began = self.began.map_or(String::from("NULL"), |d| d.to_string());
-        let ended = self.ended.map_or(String::from("NULL"), |d| d.to_string());
-        let created = self.created.to_rfc3339();
-        let modified = self.modified.to_rfc3339();
+        let began = &self.began.as_ref().map_or(String::from("NULL"), |d| d.to_string());
+        let ended = &self.ended.as_ref().map_or(String::from("NULL"), |d| d.to_string());
+        let created = &self.created;
+        let modified = &self.modified;
 
         stmt.execute(params![
             self.id,
@@ -617,26 +657,3 @@ impl Card for Status {
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
 }
-
-pub struct Book {
-    id: u64,
-    title: String,
-}
-
-pub struct Account {
-    id: u64,
-    username: String,
-}
-
-/*
-#[cfg(test)]
-mod tests {
-    use std::assert_matches::assert_matches;
-
-    #[test]
-    fn can_parse_dates() {
-        assert_matches!(String::from("2022-03-07T23:30:00Z").parse::<DateTime>
-        Some(str) => str.parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name))).map(|v| Some(v)),
-    }
-}
-*/
