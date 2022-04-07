@@ -15,6 +15,7 @@ pub enum CardType {
     Task,
     Status,
     Timelog,
+    Book,
 }
 
 impl ToString for CardType {
@@ -25,6 +26,7 @@ impl ToString for CardType {
             CardType::Task => String::from(Task::typ_str()),
             CardType::Status => String::from(Status::typ_str()),
             CardType::Timelog => String::from(Timelog::typ_str()),
+            CardType::Book => String::from(Book::typ_str()),
         }
     }
 }
@@ -38,6 +40,7 @@ impl FromStr for CardType {
             "task" => CardType::Task,
             "status" => CardType::Status,
             "timelog" => CardType::Timelog,
+            "book" => CardType::Book,
             _ => CardType::Invalid,
         })
     }
@@ -72,10 +75,26 @@ fn get_file_path_for_card(typ: &str, id: u64) -> PathBuf {
     path
 }
 
-fn get_property<T: FromStr>(json: &serde_json::Value, name: &str) -> Result<T, Error> {
-    let str = json[name].as_str().ok_or(Error::CantReadProperty(String::from(name)))?;
-    let val = str.parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name)))?;
-    Ok(val)
+fn get_property<T: FromStr + Default>(json: &serde_json::Value, name: &str) -> Result<T, Error> {
+    ////FIXME: this is horrible code...
+    let str = match json.get(name) {
+        Some(serde_json::Value::Null) => String::from("null"),
+        Some(serde_json::Value::Bool(b)) => if *b { String::from("true") } else { String::from("false") },
+        Some(serde_json::Value::String(s)) => s.to_string(),
+        Some(serde_json::Value::Number(n)) =>
+            if n.is_f64() { n.as_f64().unwrap().to_string() }
+            else if n.is_i64() { n.as_i64().unwrap().to_string() }
+            else { n.as_u64().unwrap().to_string() }
+        ////TODO: should raise Error::CantReadProperty
+        _ => String::new()
+    };
+    if str.is_empty() {
+        Ok(T::default())
+    }
+    else {
+        let val = str.parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name)))?;
+        Ok(val)
+    }
 }
 
 fn get_optional_property<T: FromStr>(json: &serde_json::Value, name: &str) -> Result<Option<T>, Error> {
@@ -127,6 +146,7 @@ fn load_card_from_json<T: Card, F: FnOnce(CardData) -> Result<T, Error>>(id: u64
         title: get_property(&json, "Title")?,
         created: get_property(&json, "Created")?,
         modified: get_property(&json, "Modified")?,
+        source: get_optional_property(&json, "Source")?,
         tags: get_string_list_property(&json, "Tags")?,
         links: get_string_list_property(&json, "Links")?,
         contents: json,
@@ -140,6 +160,7 @@ struct CardData {
     title: String,
     created: String,
     modified: String,
+    source: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
     contents: serde_json::Value,
@@ -152,6 +173,7 @@ pub trait Card
     fn title(&self) -> &String;
     fn created(&self) -> &String;
     fn modified(&self) -> &String;
+    fn source(&self) -> &Option<String>;
     fn tags(&self) -> std::slice::Iter<'_, String>;
     fn links(&self) -> std::slice::Iter<'_, String>;
 
@@ -223,7 +245,7 @@ pub trait Card
             Ok(id)
         }
         else {
-            let mut stmt = db.prepare(&format!("SELECT id FROM Projects WHERE title LIKE '%{}%'", name_or_id))
+            let mut stmt = db.prepare(&format!("SELECT id FROM {} WHERE title LIKE '%{}%'", Self::sql_table(), name_or_id))
                 .map_err(|err| Error::DatabaseError(err.to_string()))?;
             let result = match stmt.query([]) {
                 Err(e) => Err(Error::DatabaseError(e.to_string())),
@@ -249,19 +271,18 @@ pub trait Card
         let mut stmt_str = format!("SELECT id FROM {}", Self::sql_table());
         let mut have_where_clause = false;
         if !query.is_empty() {
-            if query.len() == 1 && query.iter().next().unwrap().0 == "_where" {
-                stmt_str.push_str(&format!(" WHERE {}", decode(query.iter().next().unwrap().1).unwrap()));
-                have_where_clause = true;
-            }
-            else {
-                for (key, value) in query.iter() {
-                    if key == "tag" {
-                        tags.push(value)
-                    } else {
-                        ////REVIEW: stringify automatically?
-                        stmt_str.push_str(&format!(" WHERE {} IS {}", key, decode(value).unwrap()));
-                        have_where_clause = true;
-                    }
+            for (key, value) in query.iter() {
+                if key == "tag" {
+                    tags.push(value)
+                }
+                else if key == "_where" {
+                    stmt_str = format!("{} {} {}", stmt_str, if have_where_clause { "AND" } else { "WHERE" }, decode(value).unwrap());
+                    have_where_clause = true;
+                }
+                else {
+                    ////REVIEW: stringify automatically?
+                    stmt_str = format!("{} {} {} IS {}", stmt_str, if have_where_clause { "AND" } else { "WHERE" }, key, decode(value).unwrap());
+                    have_where_clause = true;
                 }
             }
         }
@@ -360,6 +381,7 @@ pub struct Project {
     title: String,
     created: String,
     modified: String,
+    source: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
     active: bool,
@@ -373,6 +395,7 @@ impl Card for Project {
     fn title(&self) -> &String { &self.title }
     fn created(&self) -> &String { &self.created }
     fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Project }
@@ -385,6 +408,7 @@ impl Card for Project {
                 title: data.title,
                 created: data.created,
                 modified: data.modified,
+                source: data.source,
                 tags: data.tags,
                 links: data.links,
                 started: get_optional_property(&data.contents, "Started")?,
@@ -402,6 +426,7 @@ impl Card for Project {
             title VARCHAR NOT NULL,
             created DATETIME NOT NULL,
             modified DATETIME NOT NULL,
+            source VARCHAR,
             started DATETIME,
             finished DATETIME,
             active BOOLEAN DEFAULT 1
@@ -412,23 +437,18 @@ impl Card for Project {
     fn sql_table() -> &'static str { "Projects" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Projects (id, title, created, modified, started, finished, active) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        "INSERT OR REPLACE INTO Projects (id, title, created, modified, source, started, finished, active) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
-
-        let started = &self.started.as_ref().map_or(String::new(), |d| d.to_string());
-        let finished = &self.finished.as_ref().map_or(String::new(), |d| d.to_string());
-        let created = &self.created;
-        let modified = &self.modified;
-
         stmt.execute(params![
             self.id,
             self.title,
-            created,
-            modified,
-            started,
-            finished,
+            self.created,
+            self.modified,
+            self.source,
+            self.started,
+            self.finished,
             self.active,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
@@ -439,6 +459,7 @@ pub struct Task {
     description: String,
     created: String,
     modified: String,
+    source: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
     obsolete: bool,
@@ -451,6 +472,7 @@ impl Card for Task {
     fn title(&self) -> &String { &self.description }
     fn created(&self) -> &String { &self.created }
     fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Task }
@@ -463,6 +485,7 @@ impl Card for Task {
                                 description: data.title,
                                 created: data.created,
                                 modified: data.modified,
+                                source: data.source,
                                 tags: data.tags,
                                 links: data.links,
                                 completed: get_optional_property(&data.contents, "Completed")?,
@@ -479,6 +502,7 @@ impl Card for Task {
             title VARCHAR NOT NULL,
             created DATETIME NOT NULL,
             modified DATETIME NOT NULL,
+            source VARCHAR,
             completed DATETIME,
             obsolete BOOLEAN
         );
@@ -488,21 +512,17 @@ impl Card for Task {
     fn sql_table() -> &'static str { "Tasks" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Tasks (id, title, created, modified, completed, obsolete) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT OR REPLACE INTO Tasks (id, title, created, modified, source, completed, obsolete) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
-
-        let completed = &self.completed.as_ref().map_or(String::new(), |d| d.to_string());
-        let created = &self.created;
-        let modified = &self.modified;
-
         stmt.execute(params![
             self.id,
             self.description,
-            created,
-            modified,
-            completed,
+            self.created,
+            self.modified,
+            self.source,
+            self.completed,
             self.obsolete,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
@@ -512,6 +532,7 @@ pub struct Timelog {
     id: u64,
     created: String,
     modified: String,
+    source: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
     description: String,
@@ -526,6 +547,7 @@ impl Card for Timelog {
     fn title(&self) -> &String { &self.description }
     fn created(&self) -> &String { &self.created }
     fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Timelog }
@@ -538,6 +560,7 @@ impl Card for Timelog {
                                 description: data.title,
                                 created: data.created,
                                 modified: data.modified,
+                                source: data.source,
                                 tags: data.tags,
                                 links: data.links,
                                 started: get_property(&data.contents, "Started")?,
@@ -554,6 +577,7 @@ impl Card for Timelog {
             title VARCHAR NOT NULL,
             created DATETIME NOT NULL,
             modified DATETIME NOT NULL,
+            source VARCHAR,
             started DATETIME NOT NULL,
             ended DATETIME,
             category VARCHAR
@@ -563,23 +587,18 @@ impl Card for Timelog {
     fn sql_table() -> &'static str { "Timelogs" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Timelogs (id, title, created, modified, started, ended, category) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        "INSERT OR REPLACE INTO Timelogs (id, title, created, modified, source, started, ended, category) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
-
-        let started = &self.started;
-        let ended = &self.ended.as_ref().map_or(String::new(), |d| d.to_string());
-        let created = &self.created;
-        let modified = &self.modified;
-
         stmt.execute(params![
             self.id,
             self.description,
-            created,
-            modified,
-            started,
-            ended,
+            self.created,
+            self.modified,
+            self.source,
+            self.started,
+            self.ended,
             self.category,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
@@ -589,6 +608,7 @@ pub struct Status {
     id: u64,
     created: String,
     modified: String,
+    source: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
     message: String,
@@ -602,6 +622,7 @@ impl Card for Status {
     fn title(&self) -> &String { &self.message }
     fn created(&self) -> &String { &self.created }
     fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
     fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
     fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
     fn typ() -> CardType { CardType::Status }
@@ -614,6 +635,7 @@ impl Card for Status {
                                 message: data.title,
                                 created: data.created,
                                 modified: data.modified,
+                                source: data.source,
                                 tags: data.tags,
                                 links: data.links,
                                 began: get_optional_property(&data.contents, "Began")?,
@@ -629,6 +651,7 @@ impl Card for Status {
             title VARCHAR NOT NULL,
             created DATETIME NOT NULL,
             modified DATETIME NOT NULL,
+            source VARCHAR,
             began DATETIME,
             ended DATETIME
         );"#
@@ -637,23 +660,114 @@ impl Card for Status {
     fn sql_table() -> &'static str { "Statuses" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Statuses (id, title, created, modified, began, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT OR REPLACE INTO Statuses (id, title, created, modified, source, began, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
-
-        let began = &self.began.as_ref().map_or(String::from("NULL"), |d| d.to_string());
-        let ended = &self.ended.as_ref().map_or(String::from("NULL"), |d| d.to_string());
-        let created = &self.created;
-        let modified = &self.modified;
-
         stmt.execute(params![
             self.id,
             self.message,
-            created,
-            modified,
-            began,
-            ended,
+            self.created,
+            self.modified,
+            self.source,
+            self.began,
+            self.ended,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Book {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    title: String,
+    authors: String,
+    year: i32,
+    price: f32,
+    currency: String,
+    used: bool,
+    acquired: Option<String>,
+    started: Option<String>,
+    completed: Option<String>,
+}
+
+impl Card for Book {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.title }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Book }
+    fn typ_str() -> &'static str { "book" }
+
+    fn load(id: u64) -> Result<Book, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Book {
+                                id,
+                                title: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                authors: get_property(&data.contents, "Authors")?,
+                                year: get_property(&data.contents, "Year")?,
+                                price: get_property(&data.contents, "Price")?,
+                                currency: get_property(&data.contents, "Currency")?,
+                                used: get_property(&data.contents, "Used")?,
+                                acquired: get_optional_property(&data.contents, "Acquired")?,
+                                started: get_optional_property(&data.contents, "Started")?,
+                                completed: get_optional_property(&data.contents, "Completd")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Books;
+        CREATE TABLE Books (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            authors VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            year INTEGER,
+            price REAL,
+            currency CHAR(3),
+            used BOOLEAN,
+            acquired DATETIME,
+            started DATETIME,
+            completed DATETIME
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Books" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Books (id, title, authors, created, modified, source, year, price, currency, used, acquired, started, completed) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.title,
+            self.authors,
+            self.created,
+            self.modified,
+            self.source,
+            self.year,
+            self.price,
+            self.currency,
+            self.used,
+            self.acquired,
+            self.started,
+            self.completed,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
 }

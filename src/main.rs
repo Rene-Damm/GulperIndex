@@ -4,7 +4,7 @@ use notify::{RecursiveMode, Watcher};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
-use crate::cards::{Card, Project, Task, Status, Timelog};
+use crate::cards::{Card, Project, Task, Status, Timelog, Book};
 
 // API:
 // GET /<type>                  u64 list of cards of the given type
@@ -105,7 +105,8 @@ fn populate_db_from_scratch(db: &rusqlite::Connection) -> Result<(), cards::Erro
     load_all_cards_into_db::<Project>(db)?;
     load_all_cards_into_db::<Task>(db)?;
     load_all_cards_into_db::<Status>(db)?;
-    load_all_cards_into_db::<Timelog>(db)
+    load_all_cards_into_db::<Timelog>(db)?;
+    load_all_cards_into_db::<Book>(db)
 }
 
 fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
@@ -135,11 +136,13 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
         {}
         {}
         {}
+        {}
         COMMIT;"#,
                        Project::sql_schema(),
                        Task::sql_schema(),
                        Status::sql_schema(),
-                       Timelog::sql_schema());
+                       Timelog::sql_schema(),
+                       Book::sql_schema());
 
     db.execute_batch(&stmt,)
         .map_err(|err| { cards::Error::DatabaseError(err.to_string())})?;
@@ -390,13 +393,15 @@ async fn main() {
     let _task_watcher = init_watcher::<Task>(pool.clone());
     let _status_watcher = init_watcher::<Status>(pool.clone());
     let _timelog_watcher = init_watcher::<Timelog>(pool.clone());
+    let _book_watcher = init_watcher::<Book>(pool.clone());
 
     println!("   Done.");
 
     let api = filters::cards::<Project>(pool.clone())
         .or(filters::cards::<Task>(pool.clone()))
         .or(filters::cards::<Status>(pool.clone()))
-        .or(filters::cards::<Timelog>(pool.clone()));
+        .or(filters::cards::<Timelog>(pool.clone()))
+        .or(filters::cards::<Book>(pool.clone()));
 
     warp::serve(api)
         .run(([127, 0, 0, 1], 8000))
