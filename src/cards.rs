@@ -16,6 +16,12 @@ pub enum CardType {
     Status,
     Timelog,
     Book,
+    Purchase,
+    Metric,
+    Word,
+    Note,
+    Thought,
+    Achievement,
 }
 
 impl ToString for CardType {
@@ -27,6 +33,12 @@ impl ToString for CardType {
             CardType::Status => String::from(Status::typ_str()),
             CardType::Timelog => String::from(Timelog::typ_str()),
             CardType::Book => String::from(Book::typ_str()),
+            CardType::Purchase => String::from(Purchase::typ_str()),
+            CardType::Metric => String::from(Metric::typ_str()),
+            CardType::Word => String::from(Word::typ_str()),
+            CardType::Note => String::from(Note::typ_str()),
+            CardType::Thought => String::from(Thought::typ_str()),
+            CardType::Achievement => String::from(Achievement::typ_str()),
         }
     }
 }
@@ -41,6 +53,12 @@ impl FromStr for CardType {
             "status" => CardType::Status,
             "timelog" => CardType::Timelog,
             "book" => CardType::Book,
+            "purchase" => CardType::Purchase,
+            "metric" => CardType::Metric,
+            "word" => CardType::Word,
+            "note" => CardType::Note,
+            "thought" => CardType::Thought,
+            "achievement" => CardType::Achievement,
             _ => CardType::Invalid,
         })
     }
@@ -686,12 +704,10 @@ pub struct Book {
     title: String,
     authors: String,
     year: i32,
-    price: f32,
-    currency: String,
-    used: bool,
-    acquired: Option<String>,
     started: Option<String>,
     completed: Option<String>,
+    cover: Option<String>,
+    ident_code: Option<String>,
 }
 
 impl Card for Book {
@@ -718,12 +734,10 @@ impl Card for Book {
                                 links: data.links,
                                 authors: get_property(&data.contents, "Authors")?,
                                 year: get_property(&data.contents, "Year")?,
-                                price: get_property(&data.contents, "Price")?,
-                                currency: get_property(&data.contents, "Currency")?,
-                                used: get_property(&data.contents, "Used")?,
-                                acquired: get_optional_property(&data.contents, "Acquired")?,
                                 started: get_optional_property(&data.contents, "Started")?,
-                                completed: get_optional_property(&data.contents, "Completd")?,
+                                completed: get_optional_property(&data.contents, "Completed")?,
+                                cover: get_optional_property(&data.contents, "Cover")?,
+                                ident_code: get_optional_property(&data.contents, "IdentCode")?,
                             }))
     }
 
@@ -738,19 +752,17 @@ impl Card for Book {
             modified DATETIME NOT NULL,
             source VARCHAR,
             year INTEGER,
-            price REAL,
-            currency CHAR(3),
-            used BOOLEAN,
-            acquired DATETIME,
             started DATETIME,
-            completed DATETIME
+            completed DATETIME,
+            cover VARCHAR,
+            ident VARCHAR
         );"#
     }
 
     fn sql_table() -> &'static str { "Books" }
 
     fn sql_write_stmt() -> &'static str {
-        "INSERT OR REPLACE INTO Books (id, title, authors, created, modified, source, year, price, currency, used, acquired, started, completed) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+        "INSERT OR REPLACE INTO Books (id, title, authors, created, modified, source, year, started, completed, cover, ident) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
     }
 
     fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
@@ -762,12 +774,442 @@ impl Card for Book {
             self.modified,
             self.source,
             self.year,
+            self.started,
+            self.completed,
+            self.cover,
+            self.ident_code
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Purchase {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    item: String,
+    date: String,
+    price: i32,
+    currency: String,
+    used: bool,
+    store: String,
+}
+
+impl Card for Purchase {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.item }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Purchase }
+    fn typ_str() -> &'static str { "purchase" }
+
+    fn load(id: u64) -> Result<Purchase, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Purchase {
+                                id,
+                                item: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                date: get_property(&data.contents, "Date")?,
+                                price: get_property(&data.contents, "Price")?,
+                                currency: get_property(&data.contents, "Currency")?,
+                                store: get_property(&data.contents, "Store")?,
+                                used: get_property(&data.contents, "Used")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Purchases;
+        CREATE TABLE Purchases (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            date DATETIME,
+            price REAL,
+            currency CHAR(3),
+            used BOOLEAN,
+            store VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Purchases" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Purchases (id, title, created, modified, source, date, price, currency, used, store) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.item,
+            self.created,
+            self.modified,
+            self.source,
+            self.date,
             self.price,
             self.currency,
             self.used,
-            self.acquired,
-            self.started,
-            self.completed,
+            self.store,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Metric {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    name: String,
+    amount: f32,
+    timestamp: String,
+}
+
+impl Card for Metric {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.name }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Metric }
+    fn typ_str() -> &'static str { "metric" }
+
+    fn load(id: u64) -> Result<Metric, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Metric {
+                                id,
+                                name: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                amount: get_property(&data.contents, "Amount")?,
+                                timestamp: get_property(&data.contents, "Timestamp")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Metrics;
+        CREATE TABLE Metrics (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            timestamp DATETIME,
+            amount REAL
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Metrics" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Metrics (id, title, created, modified, source, timestamp, amount) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.name,
+            self.created,
+            self.modified,
+            self.source,
+            self.timestamp,
+            self.amount,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Word {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    word: String,
+    language: String,
+    category: String,
+    gender: Option<String>,
+}
+
+impl Card for Word {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.word }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Word }
+    fn typ_str() -> &'static str { "word" }
+
+    fn load(id: u64) -> Result<Word, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Word {
+                                id,
+                                word: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                language: get_property(&data.contents, "Language")?,
+                                category: get_property(&data.contents, "Category")?,
+                                gender: get_optional_property(&data.contents, "Gender")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Words;
+        CREATE TABLE Words (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            language CHAR(3),
+            category VARCHAR,
+            gender CHAR(1)
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Words" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Words (id, title, created, modified, source, language, category, gender) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.word,
+            self.created,
+            self.modified,
+            self.source,
+            self.language,
+            self.category,
+            self.gender,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Note {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    title: String,
+    text: String,
+}
+
+impl Card for Note {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.title }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Note }
+    fn typ_str() -> &'static str { "note" }
+
+    fn load(id: u64) -> Result<Note, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Note {
+                                id,
+                                title: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                text: get_property(&data.contents, "Text")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Notes;
+        CREATE TABLE Notes (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            text VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Notes" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Notes (id, title, created, modified, source, text) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.title,
+            self.created,
+            self.modified,
+            self.source,
+            self.text,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Thought {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    description: String,
+}
+
+impl Card for Thought {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.description }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Thought }
+    fn typ_str() -> &'static str { "thought" }
+
+    fn load(id: u64) -> Result<Thought, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Thought {
+                                id,
+                                description: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Thoughts;
+        CREATE TABLE Thoughts (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Thoughts" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Thoughts (id, title, created, modified, source) VALUES(?1, ?2, ?3, ?4, ?5)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.description,
+            self.created,
+            self.modified,
+            self.source,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Achievement {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    description: String,
+    date: Option<String>,
+}
+
+impl Card for Achievement {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.description }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Achievement }
+    fn typ_str() -> &'static str { "achievement" }
+
+    fn load(id: u64) -> Result<Achievement, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Achievement {
+                                id,
+                                description: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                date: get_optional_property(&data.contents, "Date")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Achievements;
+        CREATE TABLE Achievements (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            date VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Achievements" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Achievements (id, title, created, modified, source, date) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.description,
+            self.created,
+            self.modified,
+            self.source,
+            self.date,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
 }

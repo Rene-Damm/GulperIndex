@@ -4,7 +4,7 @@ use notify::{RecursiveMode, Watcher};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
-use crate::cards::{Card, Project, Task, Status, Timelog, Book};
+use crate::cards::{Card, Project, Task, Status, Timelog, Book, Purchase, Metric, Word, Achievement, Note, Thought};
 
 // API:
 // GET /<type>                  u64 list of cards of the given type
@@ -25,6 +25,8 @@ use crate::cards::{Card, Project, Task, Status, Timelog, Book};
 // Explore
 // - Using an external SQL DB on the system for storage such that the DB is visible/accessible
 //   to everyone without going through gulper_index
+
+////TODO: when the cards are modified, automatically run the report script in R
 
 ////TODO: store cards.sqlite in a place where other tools can access it
 
@@ -106,6 +108,12 @@ fn populate_db_from_scratch(db: &rusqlite::Connection) -> Result<(), cards::Erro
     load_all_cards_into_db::<Task>(db)?;
     load_all_cards_into_db::<Status>(db)?;
     load_all_cards_into_db::<Timelog>(db)?;
+    load_all_cards_into_db::<Purchase>(db)?;
+    load_all_cards_into_db::<Metric>(db)?;
+    load_all_cards_into_db::<Word>(db)?;
+    load_all_cards_into_db::<Note>(db)?;
+    load_all_cards_into_db::<Thought>(db)?;
+    load_all_cards_into_db::<Achievement>(db)?;
     load_all_cards_into_db::<Book>(db)
 }
 
@@ -137,11 +145,23 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
         {}
         {}
         {}
+        {}
+        {}
+        {}
+        {}
+        {}
+        {}
         COMMIT;"#,
                        Project::sql_schema(),
                        Task::sql_schema(),
                        Status::sql_schema(),
                        Timelog::sql_schema(),
+                       Purchase::sql_schema(),
+                       Metric::sql_schema(),
+                       Word::sql_schema(),
+                       Note::sql_schema(),
+                       Thought::sql_schema(),
+                       Achievement::sql_schema(),
                        Book::sql_schema());
 
     db.execute_batch(&stmt,)
@@ -393,7 +413,13 @@ async fn main() {
     let _task_watcher = init_watcher::<Task>(pool.clone());
     let _status_watcher = init_watcher::<Status>(pool.clone());
     let _timelog_watcher = init_watcher::<Timelog>(pool.clone());
+    let _purchase_watcher = init_watcher::<Purchase>(pool.clone());
     let _book_watcher = init_watcher::<Book>(pool.clone());
+    let _metric_watcher = init_watcher::<Metric>(pool.clone());
+    let _word_watcher = init_watcher::<Word>(pool.clone());
+    let _note_watcher = init_watcher::<Note>(pool.clone());
+    let _thought_watcher = init_watcher::<Thought>(pool.clone());
+    let _achievement_watcher = init_watcher::<Achievement>(pool.clone());
 
     println!("   Done.");
 
@@ -401,6 +427,12 @@ async fn main() {
         .or(filters::cards::<Task>(pool.clone()))
         .or(filters::cards::<Status>(pool.clone()))
         .or(filters::cards::<Timelog>(pool.clone()))
+        .or(filters::cards::<Purchase>(pool.clone()))
+        .or(filters::cards::<Metric>(pool.clone()))
+        .or(filters::cards::<Word>(pool.clone()))
+        .or(filters::cards::<Note>(pool.clone()))
+        .or(filters::cards::<Thought>(pool.clone()))
+        .or(filters::cards::<Achievement>(pool.clone()))
         .or(filters::cards::<Book>(pool.clone()));
 
     warp::serve(api)
