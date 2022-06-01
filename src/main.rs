@@ -1,5 +1,6 @@
 use std::ops::Deref;
 use std::path::{PathBuf};
+use std::sync::mpsc;
 use notify::{RecursiveMode, Watcher};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -26,11 +27,78 @@ use crate::cards::{Card, Project, Task, Status, Timelog, Book, Purchase, Metric,
 // - Using an external SQL DB on the system for storage such that the DB is visible/accessible
 //   to everyone without going through gulper_index
 
-////TODO: when the cards are modified, automatically run the report script in R
-
 ////TODO: store cards.sqlite in a place where other tools can access it
 
 mod cards;
+
+mod report {
+    use std::process::{Command, ExitStatus};
+    use std::sync::mpsc;
+    use std::{io, thread};
+    use std::io::Write;
+
+    const R_BIN_PATH: &str = "M:/R/4.1.3/bin/x64";
+    const RSTUDIO_BIN_PATH: &str = "C:/Program Files/RStudio/bin/quarto/bin";
+    const DAILY_REPORT_PATH: &str = "C:/Dropbox/Data/R/DailyReport.Rmd";
+
+    #[derive(PartialEq)]
+    pub enum ReportThreadCommand {
+        Quit,
+        Refresh,
+    }
+
+    pub struct ReportThread {
+        handle: thread::JoinHandle<()>,
+        pub channel: mpsc::Sender<ReportThreadCommand>,
+    }
+
+    //Rscript -e "library(rmarkdown); rmarkdown::render('C:/Dropbox/Data/R/DailyReport.Rmd', 'html_document')"
+
+    pub fn spawn_thread() -> ReportThread {
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            loop {
+                let command = rx.recv().unwrap();
+                if command == ReportThreadCommand::Quit {
+                    break
+                }
+                else if command == ReportThreadCommand::Refresh {
+                    ////TODO: consume all pending Refresh commands before running a refresh
+                    let output = Command::new(format!("{}/Rscript.exe", R_BIN_PATH))
+                        .arg("-e")
+                        .arg(format!("library(rmarkdown); rmarkdown::render('{}', 'html_document')", DAILY_REPORT_PATH))
+                        .env("PATH", RSTUDIO_BIN_PATH)
+                        .output()
+                        .expect("Failed to run RScript.exe");
+
+                    println!("Updated DailyReport.");
+                    if !output.status.success() {
+                        println!("   Failed!")
+                    }
+                    io::stdout().write_all(&output.stdout);
+                    io::stdout().write_all(&output.stderr);
+
+                    ////TODO: copy the current report to the Data/Reports/Daily folder
+                }
+            }
+        });
+
+        ReportThread {
+            handle,
+            channel: tx,
+        }
+    }
+
+    pub fn quit_thread(thread: ReportThread) {
+        thread.channel.send(ReportThreadCommand::Quit);
+        thread.handle.join();
+    }
+
+    pub fn update_report(channel: &mpsc::Sender<ReportThreadCommand>) {
+        channel.send(ReportThreadCommand::Refresh);
+    }
+}
 
 fn remove_card_from_db<T: Card>(id: u64, db: &rusqlite::Connection, include_incoming_links: bool) -> Result<(), cards::Error> {
 
@@ -172,7 +240,7 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
 
 struct FileWatcher(notify::RecommendedWatcher);
 
-fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
+fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>, report_thread: mpsc::Sender<report::ReportThreadCommand>) -> FileWatcher {
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
 
@@ -185,7 +253,7 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
             }
         }
 
-        fn add_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>) {
+        fn add_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>, report_thread: mpsc::Sender<report::ReportThreadCommand>) {
             if let Ok(id) = name.parse::<u64>() {
                 let db = db.get()
                     .expect("Cannot get DB connection");
@@ -197,10 +265,11 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                 }
                 db.execute("COMMIT", [])
                     .expect("Cannot commit transaction");
+                report::update_report(&report_thread);
             }
         }
 
-        fn remove_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>, include_incoming_links: bool) {
+        fn remove_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>, report_thread: mpsc::Sender<report::ReportThreadCommand>, include_incoming_links: bool) {
             if let Ok(id) = name.parse::<u64>() {
                 let db = db.get()
                     .expect("Cannot get DB connection");
@@ -212,10 +281,11 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                 }
                 db.execute("COMMIT", [])
                     .expect("Cannot commit transaction");
+                report::update_report(&report_thread);
             }
         }
 
-        fn update_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>) {
+        fn update_card<T: Card>(name: String, db: Pool<SqliteConnectionManager>, report_thread: mpsc::Sender<report::ReportThreadCommand>) {
             if let Ok(id) = name.parse::<u64>() {
                 let db = db.get()
                     .expect("Cannot get DB connection");
@@ -231,6 +301,7 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                 }
                 db.execute("COMMIT", [])
                     .expect("Cannot commit transaction");
+                report::update_report(&report_thread);
             }
         }
 
@@ -241,7 +312,7 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                         for path in event.paths.iter().filter(|p| is_json_file(p)) {
                             println!("Added card {}", path.to_str().unwrap());
                             if let Some(name) = path.file_stem() {
-                                add_card::<T>(String::from(name.to_str().unwrap()), db.clone());
+                                add_card::<T>(String::from(name.to_str().unwrap()), db.clone(), report_thread.clone());
                             };
                         }
                     },
@@ -251,7 +322,7 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                             if let Some(name) = path.file_stem() {
                                 ////FIXME: *If* the file comes *back* we have destroyed all incoming links and they are gone.
                                 ////       (should we leave incoming links in the DB?)
-                                remove_card::<T>(String::from(name.to_str().unwrap()), db.clone(), true);
+                                remove_card::<T>(String::from(name.to_str().unwrap()), db.clone(), report_thread.clone(), true);
                             };
                         }
                     },
@@ -260,7 +331,7 @@ fn init_watcher<T: Card>(db: Pool<SqliteConnectionManager>) -> FileWatcher {
                         for path in event.paths.iter().filter(|p| is_json_file(p)) {
                             println!("Modified card {}", path.to_str().unwrap());
                             if let Some(name) = path.file_stem() {
-                                update_card::<T>(String::from(name.to_str().unwrap()), db.clone());
+                                update_card::<T>(String::from(name.to_str().unwrap()), db.clone(), report_thread.clone());
                             };
                         }
                     },
@@ -409,17 +480,20 @@ async fn main() {
     init_db(pool.clone().get().expect("Cannot get DB connection").deref())
         .expect("Cannot initialize DB");
 
-    let _project_watcher = init_watcher::<Project>(pool.clone());
-    let _task_watcher = init_watcher::<Task>(pool.clone());
-    let _status_watcher = init_watcher::<Status>(pool.clone());
-    let _timelog_watcher = init_watcher::<Timelog>(pool.clone());
-    let _purchase_watcher = init_watcher::<Purchase>(pool.clone());
-    let _book_watcher = init_watcher::<Book>(pool.clone());
-    let _metric_watcher = init_watcher::<Metric>(pool.clone());
-    let _word_watcher = init_watcher::<Word>(pool.clone());
-    let _note_watcher = init_watcher::<Note>(pool.clone());
-    let _thought_watcher = init_watcher::<Thought>(pool.clone());
-    let _achievement_watcher = init_watcher::<Achievement>(pool.clone());
+    let report_thread = report::spawn_thread();
+    report::update_report(&report_thread.channel);
+
+    let _project_watcher = init_watcher::<Project>(pool.clone(), report_thread.channel.clone());
+    let _task_watcher = init_watcher::<Task>(pool.clone(), report_thread.channel.clone());
+    let _status_watcher = init_watcher::<Status>(pool.clone(), report_thread.channel.clone());
+    let _timelog_watcher = init_watcher::<Timelog>(pool.clone(), report_thread.channel.clone());
+    let _purchase_watcher = init_watcher::<Purchase>(pool.clone(), report_thread.channel.clone());
+    let _book_watcher = init_watcher::<Book>(pool.clone(), report_thread.channel.clone());
+    let _metric_watcher = init_watcher::<Metric>(pool.clone(), report_thread.channel.clone());
+    let _word_watcher = init_watcher::<Word>(pool.clone(), report_thread.channel.clone());
+    let _note_watcher = init_watcher::<Note>(pool.clone(), report_thread.channel.clone());
+    let _thought_watcher = init_watcher::<Thought>(pool.clone(), report_thread.channel.clone());
+    let _achievement_watcher = init_watcher::<Achievement>(pool.clone(), report_thread.channel.clone());
 
     println!("   Done.");
 
@@ -438,4 +512,6 @@ async fn main() {
     warp::serve(api)
         .run(([127, 0, 0, 1], 8000))
         .await;
+
+    report::quit_thread(report_thread);
 }
