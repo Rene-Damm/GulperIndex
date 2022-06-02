@@ -5,7 +5,7 @@ use notify::{RecursiveMode, Watcher};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use warp::Filter;
-use crate::cards::{Card, Project, Task, Status, Timelog, Book, Purchase, Metric, Word, Achievement, Note, Thought};
+use crate::cards::{Card, Project, Task, Status, Timelog, Book, Purchase, Metric, Word, Achievement, Note, Thought, Notebook};
 
 // API:
 // GET /<type>                  u64 list of cards of the given type
@@ -36,10 +36,13 @@ mod report {
     use std::sync::mpsc;
     use std::{io, thread};
     use std::io::Write;
+    use chrono::Utc;
 
     const R_BIN_PATH: &str = "M:/R/4.1.3/bin/x64";
     const RSTUDIO_BIN_PATH: &str = "C:/Program Files/RStudio/bin/quarto/bin";
-    const DAILY_REPORT_PATH: &str = "C:/Dropbox/Data/R/DailyReport.Rmd";
+    const DAILY_REPORT_RMD_PATH: &str = "C:/Dropbox/Data/R/DailyReport.Rmd";
+    const DAILY_REPORT_HTML_PATH: &str = "C:/Dropbox/Data/R/DailyReport.html";
+    const DAILY_REPORT_FOLDER_PATH: &str = "C:/Dropbox/Data/Reports/Daily";
 
     #[derive(PartialEq)]
     pub enum ReportThreadCommand {
@@ -67,7 +70,7 @@ mod report {
                     ////TODO: consume all pending Refresh commands before running a refresh
                     let output = Command::new(format!("{}/Rscript.exe", R_BIN_PATH))
                         .arg("-e")
-                        .arg(format!("library(rmarkdown); rmarkdown::render('{}', 'html_document')", DAILY_REPORT_PATH))
+                        .arg(format!("library(rmarkdown); rmarkdown::render('{}', 'html_document')", DAILY_REPORT_RMD_PATH))
                         .env("PATH", RSTUDIO_BIN_PATH)
                         .output()
                         .expect("Failed to run RScript.exe");
@@ -75,11 +78,13 @@ mod report {
                     println!("Updated DailyReport.");
                     if !output.status.success() {
                         println!("   Failed!")
+                    } else {
+                        // Copy the last DailyReport to the Reports/Daily/ folder under
+                        // the current date.
+                        let now = Utc::now();
+                        let dmy = now.format("%Y-%m-%d");
+                        std::fs::copy(DAILY_REPORT_HTML_PATH, format!("{}/{}.html", DAILY_REPORT_FOLDER_PATH, dmy));
                     }
-                    io::stdout().write_all(&output.stdout);
-                    io::stdout().write_all(&output.stderr);
-
-                    ////TODO: copy the current report to the Data/Reports/Daily folder
                 }
             }
         });
@@ -182,6 +187,7 @@ fn populate_db_from_scratch(db: &rusqlite::Connection) -> Result<(), cards::Erro
     load_all_cards_into_db::<Note>(db)?;
     load_all_cards_into_db::<Thought>(db)?;
     load_all_cards_into_db::<Achievement>(db)?;
+    load_all_cards_into_db::<Notebook>(db)?;
     load_all_cards_into_db::<Book>(db)
 }
 
@@ -219,6 +225,7 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
         {}
         {}
         {}
+        {}
         COMMIT;"#,
                        Project::sql_schema(),
                        Task::sql_schema(),
@@ -230,6 +237,7 @@ fn init_db(db: &rusqlite::Connection) -> Result<(), cards::Error> {
                        Note::sql_schema(),
                        Thought::sql_schema(),
                        Achievement::sql_schema(),
+                       Notebook::sql_schema(),
                        Book::sql_schema());
 
     db.execute_batch(&stmt,)
@@ -494,6 +502,7 @@ async fn main() {
     let _note_watcher = init_watcher::<Note>(pool.clone(), report_thread.channel.clone());
     let _thought_watcher = init_watcher::<Thought>(pool.clone(), report_thread.channel.clone());
     let _achievement_watcher = init_watcher::<Achievement>(pool.clone(), report_thread.channel.clone());
+    let _notebook_watcher = init_watcher::<Notebook>(pool.clone(), report_thread.channel.clone());
 
     println!("   Done.");
 
@@ -507,6 +516,7 @@ async fn main() {
         .or(filters::cards::<Note>(pool.clone()))
         .or(filters::cards::<Thought>(pool.clone()))
         .or(filters::cards::<Achievement>(pool.clone()))
+        .or(filters::cards::<Notebook>(pool.clone()))
         .or(filters::cards::<Book>(pool.clone()));
 
     warp::serve(api)

@@ -22,6 +22,7 @@ pub enum CardType {
     Note,
     Thought,
     Achievement,
+    Notebook,
 }
 
 impl ToString for CardType {
@@ -39,6 +40,7 @@ impl ToString for CardType {
             CardType::Note => String::from(Note::typ_str()),
             CardType::Thought => String::from(Thought::typ_str()),
             CardType::Achievement => String::from(Achievement::typ_str()),
+            CardType::Notebook => String::from(Notebook::typ_str()),
         }
     }
 }
@@ -59,6 +61,7 @@ impl FromStr for CardType {
             "note" => CardType::Note,
             "thought" => CardType::Thought,
             "achievement" => CardType::Achievement,
+            "notebook" => CardType::Notebook,
             _ => CardType::Invalid,
         })
     }
@@ -119,10 +122,8 @@ fn get_optional_property<T: FromStr>(json: &serde_json::Value, name: &str) -> Re
     if let Some(ref val) = json.get(name) {
         match val {
             serde_json::Value::Null => Ok(None),
-            _ => match val.as_str() {
-                Some(str) => str.parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name))).map(|v| Some(v)),
-                _ => Err(Error::CantReadProperty(String::from(name)))
-            }
+            ////REVIEW: There's probably better ways to turn a serde::Value into a string but haven't found one so far (as_str only works for actual strings).
+            _ => format!("{}", val).parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name))).map(|v| Some(v)),
         }
     }
     else
@@ -1210,6 +1211,94 @@ impl Card for Achievement {
             self.modified,
             self.source,
             self.date,
+        ]).map_err(|err| Error::DatabaseError(err.to_string()))
+    }
+}
+
+pub struct Notebook {
+    id: u64,
+    created: String,
+    modified: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+    title: String,
+    description: String,
+    location: String,
+    format: String,
+    pages: Option<u32>,
+    started: Option<String>,
+    ended: Option<String>,
+}
+
+impl Card for Notebook {
+
+    fn id(&self) -> u64 { self.id }
+    fn title(&self) -> &String { &self.description }
+    fn created(&self) -> &String { &self.created }
+    fn modified(&self) -> &String { &self.modified }
+    fn source(&self) -> &Option<String> { &self.source }
+    fn tags(&self) -> std::slice::Iter<'_, String> { self.tags.iter() }
+    fn links(&self) -> std::slice::Iter<'_, String> { self.links.iter() }
+    fn typ() -> CardType { CardType::Notebook }
+    fn typ_str() -> &'static str { "notebook" }
+
+    fn load(id: u64) -> Result<Notebook, Error> {
+        load_card_from_json(id,
+                            |data| Ok(Notebook {
+                                id,
+                                title: data.title,
+                                created: data.created,
+                                modified: data.modified,
+                                source: data.source,
+                                tags: data.tags,
+                                links: data.links,
+                                description: get_property(&data.contents, "Description")?,
+                                location: get_property(&data.contents, "Location")?,
+                                format: get_property(&data.contents, "Format")?,
+                                pages: get_optional_property(&data.contents, "Pages")?,
+                                started: get_optional_property(&data.contents, "Started")?,
+                                ended: get_optional_property(&data.contents, "Ended")?,
+                            }))
+    }
+
+    fn sql_schema() -> &'static str {
+        r#"
+        DROP TABLE IF EXISTS Notebooks;
+        CREATE TABLE Notebooks (
+            id INTEGER PRIMARY KEY,
+            title VARCHAR NOT NULL,
+            created DATETIME NOT NULL,
+            modified DATETIME NOT NULL,
+            source VARCHAR,
+            description VARCHAR,
+            location VARCHAR,
+            format VARCHAR,
+            pages INTEGER,
+            started VARCHAR,
+            ended VARCHAR
+        );"#
+    }
+
+    fn sql_table() -> &'static str { "Notebooks" }
+
+    fn sql_write_stmt() -> &'static str {
+        "INSERT OR REPLACE INTO Notebooks (id, title, created, modified, source, description, location, format, pages, started, ended) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+    }
+
+    fn sql_write(&self, stmt: &mut rusqlite::Statement) -> Result<usize, Error> {
+        stmt.execute(params![
+            self.id,
+            self.title,
+            self.created,
+            self.modified,
+            self.source,
+            self.description,
+            self.location,
+            self.format,
+            self.pages,
+            self.started,
+            self.ended,
         ]).map_err(|err| Error::DatabaseError(err.to_string()))
     }
 }
