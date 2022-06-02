@@ -122,6 +122,7 @@ fn get_optional_property<T: FromStr>(json: &serde_json::Value, name: &str) -> Re
     if let Some(ref val) = json.get(name) {
         match val {
             serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(str) => str.parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name))).map(|v| Some(v)),
             ////REVIEW: There's probably better ways to turn a serde::Value into a string but haven't found one so far (as_str only works for actual strings).
             _ => format!("{}", val).parse::<T>().map_err(|_| Error::CantReadProperty(String::from(name))).map(|v| Some(v)),
         }
