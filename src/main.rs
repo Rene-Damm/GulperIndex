@@ -32,10 +32,9 @@ use crate::cards::{Card, Project, Task, Status, Timelog, Book, Purchase, Metric,
 mod cards;
 
 mod report {
-    use std::process::{Command, ExitStatus};
+    use std::process::Command;
     use std::sync::mpsc;
-    use std::{io, thread};
-    use std::io::Write;
+    use std::thread;
     use chrono::Utc;
 
     const R_BIN_PATH: &str = "M:/R/4.1.3/bin/x64";
@@ -54,8 +53,6 @@ mod report {
         handle: thread::JoinHandle<()>,
         pub channel: mpsc::Sender<ReportThreadCommand>,
     }
-
-    //Rscript -e "library(rmarkdown); rmarkdown::render('C:/Dropbox/Data/R/DailyReport.Rmd', 'html_document')"
 
     pub fn spawn_thread() -> ReportThread {
 
